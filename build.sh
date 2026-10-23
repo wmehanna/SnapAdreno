@@ -9,7 +9,8 @@ KH=$SDK/System/Library/Frameworks/Kernel.framework/Headers
 # The *26A428.h headers reconstruct private Apple class layouts from the KDK and
 # are not distributed. Generate them from your own KDK_27.0_26A428 into include/
 # (tools/gen-iomfb-header.py writes IOMobileGraphicsFamily26A428.h) before building.
-for h in $(cat "$D"/src/* "$D"/include/*.h "$D"/../include/*.h 2>/dev/null | sed -n 's/^#include "\([A-Za-z0-9_]*26A428\.h\)".*/\1/p' | sort -u); do
+# The scan reads every source the compiler sees, the ordered parts in src/<unit>/ included.
+for h in $(cat "$D"/src/*.* "$D"/src/*/*.cpp "$D"/include/*.h "$D"/../include/*.h 2>/dev/null | sed -n 's/^#include "\([A-Za-z0-9_]*26A428\.h\)".*/\1/p' | sort -u); do
     [ -f "$D/include/$h" ] || { echo "error: missing $D/include/$h (reconstructed from Apple's KDK 26A428, not distributed; generate it from your KDK)" >&2; exit 2; }
 done
 mkdir -p "$OBJ"
