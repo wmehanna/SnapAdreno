@@ -183,6 +183,36 @@ static inline int adreno_display_plan(const struct adreno_display_surface *s,
     return ADRENO_DISPLAY_OK;
 }
 
+/* What a layer-0 swap asks that this 1:1, top-left copy does not do (agents/display-modeset). The kext's
+ * -DADRENO_DISPLAY_TRACE_MODES logs it; nothing refuses on it. (sx, sy, sw, sh) is the IOMFB source rectangle in a
+ * surface of surface_w x surface_h (0 x 0: unknown, the rectangles alone are judged), (dx, dy, dw, dh) the destination
+ * rectangle on a panel of panel_w x panel_h. 0: the copy shows exactly what the swap asks.
+ *   SCALED   source and destination sizes differ (a scaled resolution presented for the display to scale);
+ *   PLACED   the destination is not the whole panel;
+ *   CROPPED  the source is not the whole surface;
+ *   SIZED    the surface is not the panel's size (the copy shows its top-left overlap). */
+enum {
+    ADRENO_DISPLAY_GEOMETRY_SCALED = 1u, ADRENO_DISPLAY_GEOMETRY_PLACED = 2u, ADRENO_DISPLAY_GEOMETRY_CROPPED = 4u,
+    ADRENO_DISPLAY_GEOMETRY_SIZED = 8u,
+};
+static inline unsigned adreno_display_swap_geometry(int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+                                                    int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                                                    uint64_t surface_w, uint64_t surface_h,
+                                                    uint64_t panel_w, uint64_t panel_h)
+{
+    unsigned g = 0;
+    if (sw != dw || sh != dh)
+        g |= ADRENO_DISPLAY_GEOMETRY_SCALED;
+    if (dx || dy || dw < 0 || dh < 0 || (uint64_t)dw != panel_w || (uint64_t)dh != panel_h)
+        g |= ADRENO_DISPLAY_GEOMETRY_PLACED;
+    if (sx || sy || sw < 0 || sh < 0 ||
+        ((surface_w || surface_h) && ((uint64_t)sw != surface_w || (uint64_t)sh != surface_h)))
+        g |= ADRENO_DISPLAY_GEOMETRY_CROPPED;
+    if ((surface_w || surface_h) && (surface_w != panel_w || surface_h != panel_h))
+        g |= ADRENO_DISPLAY_GEOMETRY_SIZED;
+    return g;
+}
+
 /* Plan, then copy row by row. On error nothing was read, maintained or written. */
 static inline int adreno_display_copy(const struct adreno_display_surface *s,
                                       const struct adreno_display_scanout *d,

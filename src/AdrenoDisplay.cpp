@@ -315,3 +315,4 @@ bool AdrenoDisplay::are_timings_enabled() const
 #include "AdrenoDisplay/modeset.cpp"
 #include "AdrenoDisplay/frame_latch.cpp"
 #include "AdrenoDisplay/attributes.cpp"
+#include "AdrenoDisplay/trace.cpp"
