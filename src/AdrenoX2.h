@@ -92,6 +92,19 @@ extern "C" void AdrenoPresentSyncCounters(uint64_t *marks, uint64_t *overflows, 
 #if ADRENO_RESIDENT_REPIN
 extern "C" uint64_t AdrenoGPUMapBudget(void);   // AdrenoMemoryMap.cpp: the residency budget in effect, bytes
 #endif
+// The head rule (agents/display-modeset; -DADRENO_RESIDENT_HEAD_OFFSET=1 in every unit, with ADRENO_RESIDENT_REPIN): a
+// client buffer at a page-unaligned address, whose IOGPU map is round_page(page offset + length) long, is pinned and
+// mapped in whole pages with its offset in the first page recorded, instead of refused on every commit (b12v23 and
+// org2: a WindowServer buffer refused -83 when System Settings > Displays opened, then every composite that listed it
+// failed). IB relocations and FILL32 ranges are the client's buffer offsets, checked against the descriptor's bytes and
+// moved by the head; cache maintenance covers only the descriptor's lines (compat/adreno-resource-tail.h). Boot-arg
+// adreno_head_offset=0 refuses such buffers as before. Off by default; without it this source compiles as before.
+#ifndef ADRENO_RESIDENT_HEAD_OFFSET
+#define ADRENO_RESIDENT_HEAD_OFFSET 0
+#endif
+#if ADRENO_RESIDENT_HEAD_OFFSET && !ADRENO_RESIDENT_REPIN
+#error "ADRENO_RESIDENT_HEAD_OFFSET needs ADRENO_RESIDENT_REPIN (the tail rule it extends and the clean refusal)"
+#endif
 #if ADRENO_PIPELINE
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -217,6 +230,14 @@ private:
     int32_t fRefusal;              // the last commit error reported committed (a clean refusal), 0 none
     uint32_t fRefusalStatus;       // its native status
     uint32_t fRefusalReported;     // reportRefused has logged this map
+#endif
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    // The head rule (adreno-resource-tail.h): called by pinBacking after the wire, under the lock; on refusal it has
+    // completed and released the backing. *head: the descriptor's offset in its first page.
+    bool admitHead(IOMemoryDescriptor *backing, IODirection direction, uint64_t bytes, uint64_t *head);
+    static bool headOffsetWanted();   // boot-arg adreno_head_offset (default 1), read once
+    int headRange(uint64_t offset, uint64_t bytes, uint64_t *mapOffset) const;   // caller holds the lock
+    uint64_t fBackingHead;         // fBacking's first byte's offset in its first page when that is not 0, else 0
 #endif
 };
 

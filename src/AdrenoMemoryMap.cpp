@@ -16,7 +16,11 @@
 #include "../../../../compat/adreno-resource-tail.h"
 // agents/resident-evict (REPORT.md). The budget's boot-arg ceiling; counters and log rate limits, all in bss (R13).
 static constexpr uint32_t kAdrenoResidentMaxMiB = 4096;
-enum { kRepinTail, kRepinRefused, kRepinRetried, kRepinRecovered, kRepinReports, kRepinCounters };
+enum { kRepinTail, kRepinRefused, kRepinRetried, kRepinRecovered, kRepinReports,
+#if ADRENO_RESIDENT_HEAD_OFFSET
+       kRepinHead,
+#endif
+       kRepinCounters };
 static uint64_t gRepin[kRepinCounters];
 static uint32_t gRepinMapFailedLogged, gRepinPrepareLogged;
 static void repinCount(unsigned which) { __atomic_fetch_add(&gRepin[which], 1, __ATOMIC_RELAXED); }
@@ -405,7 +409,13 @@ int AdrenoMemoryMap::cacheSubmission(unsigned direction)
         coherentCount(kCoherentPlain,1);
     }
 #endif
-#if ADRENO_RESIDENT_REPIN
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    // A short or head-offset backing: only its own lines, partial first and last lines cleaned (adreno-resource-tail.h).
+    int result=!backing ? ADRENO_RESOURCE_E_STATE : fBackingHead ?
+        adreno_head_cache(&fResource,fBackingHead,fBackingBytes,direction,0,fResource.logical_length,maintainCache,this) :
+        fBackingBytes ? adreno_tail_cache(&fResource,fBackingBytes,direction,0,fResource.logical_length,maintainCache,this) :
+        adreno_resource_cache(&fResource,direction,maintainCache,this);
+#elif ADRENO_RESIDENT_REPIN
     // A short backing: only its own lines, its partial last line cleaned rather than invalidated (adreno-resource-tail.h).
     int result=!backing ? ADRENO_RESOURCE_E_STATE : fBackingBytes ?
         adreno_tail_cache(&fResource,fBackingBytes,direction,0,fResource.logical_length,maintainCache,this) :
@@ -441,7 +451,13 @@ int AdrenoMemoryMap::cacheRange(unsigned direction, uint64_t offset, uint64_t by
     if (fCoherentHow==ADRENO_COHERENT_SKIP) { coherentCount(kCoherentSkips,1); coherentCount(kCoherentSkipBytes,bytes);
                                               direction=0; }
 #endif
-#if ADRENO_RESIDENT_REPIN
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    uint64_t at=offset;   // the FILL32 target is the client's buffer range: inside the descriptor, moved by the head
+    int result=!backing ? ADRENO_RESOURCE_E_STATE : headRange(offset,bytes,&at) ? ADRENO_RESOURCE_E_RANGE : fBackingHead ?
+        adreno_head_cache(&fResource,fBackingHead,fBackingBytes,direction,at,bytes,maintainCache,this) : fBackingBytes ?
+        adreno_tail_cache(&fResource,fBackingBytes,direction,offset,bytes,maintainCache,this) :
+        adreno_resource_cache_range(&fResource,direction,offset,bytes,maintainCache,this);
+#elif ADRENO_RESIDENT_REPIN
     int result=!backing ? ADRENO_RESOURCE_E_STATE : fBackingBytes ?
         adreno_tail_cache(&fResource,fBackingBytes,direction,offset,bytes,maintainCache,this) :
         adreno_resource_cache_range(&fResource,direction,offset,bytes,maintainCache,this);
@@ -466,7 +482,13 @@ int AdrenoMemoryMap::resolveFill(uint64_t offset, uint64_t bytes, uint64_t *addr
     bool backing=memory && fBacking && nativeAllocated() && memory->get_iomd_ptr()==fBacking &&
         fResource.address==IOGPUMemoryMap::getGPUVirtualAddress() &&
         fResource.logical_length==IOGPUMemoryMap::getLength();
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    uint64_t at=offset;   // the client's buffer offset: inside the descriptor, moved by the head
+    int result=!backing ? ADRENO_RESOURCE_E_STATE : headRange(offset,bytes,&at) ? ADRENO_RESOURCE_E_RANGE :
+        adreno_fill32_resource_range(&fResource,at,bytes,address);
+#else
     int result=backing ? adreno_fill32_resource_range(&fResource,offset,bytes,address) : ADRENO_RESOURCE_E_STATE;
+#endif
     IORecursiveLockUnlock(fLock);
     return result;
 }
@@ -481,7 +503,13 @@ int AdrenoMemoryMap::resolveRange(uint64_t offset, uint64_t bytes, uint64_t *add
     bool backing=memory && fBacking && nativeAllocated() && memory->get_iomd_ptr()==fBacking &&
         fResource.address==IOGPUMemoryMap::getGPUVirtualAddress() &&
         fResource.logical_length==IOGPUMemoryMap::getLength();
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    uint64_t at=offset;
+    int result=!backing ? ADRENO_RESOURCE_E_STATE : headRange(offset,bytes,&at) ? ADRENO_RESOURCE_E_RANGE :
+        adreno_ib_resource_range(&fResource,at,bytes,address);
+#else
     int result=backing ? adreno_ib_resource_range(&fResource,offset,bytes,address) : ADRENO_RESOURCE_E_STATE;
+#endif
     IORecursiveLockUnlock(fLock);
     return result;
 }
@@ -558,7 +586,14 @@ int AdrenoMemoryMap::pinBacking(void *ctx)
     // inside the map's last page is admitted and mapped in whole pages; any larger shortfall is refused as before.
     const uint64_t bytes = backing ? backing->getLength() : 0;
     const bool tail = bytes < map->fResource.logical_length && adreno_tail_admit(bytes, map->fResource.logical_length);
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    // The head rule: a short descriptor whose first byte may sit inside its page; the head is known once it is wired.
+    const bool headed = bytes < map->fResource.logical_length && headOffsetWanted() &&
+                        adreno_head_fit(bytes, map->fResource.logical_length);
+    if (map->fBacking || !backing || (bytes < map->fResource.logical_length && !tail && !headed)) {
+#else
     if (map->fBacking || !backing || (bytes < map->fResource.logical_length && !tail)) {
+#endif
 #else
     if (map->fBacking || !backing || backing->getLength() < map->fResource.logical_length) {
 #endif
@@ -578,9 +613,17 @@ int AdrenoMemoryMap::pinBacking(void *ctx)
     }
     map->fLastNativeStatus = static_cast<uint32_t>(result);
     if (result != kIOReturnSuccess) { backing->release(); return result; }
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    uint64_t head = 0;
+    if (headed && !map->admitHead(backing, direction, bytes, &head)) return kIOReturnBadArgument;
+#endif
     map->fBacking = backing;
     map->fBackingDirection = direction;
-#if ADRENO_RESIDENT_REPIN
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    map->fBackingBytes = tail || headed ? bytes : 0;
+    map->fBackingHead = head;
+    if (tail && !head) repinCount(kRepinTail);
+#elif ADRENO_RESIDENT_REPIN
     map->fBackingBytes = tail ? bytes : 0;
     if (tail) repinCount(kRepinTail);
 #endif
@@ -602,6 +645,9 @@ int AdrenoMemoryMap::unpinBacking(void *ctx)
 #if ADRENO_RESIDENT_REPIN
     map->fBackingBytes = 0;
 #endif
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    map->fBackingHead = 0;
+#endif
 #if ADRENO_CACHE_SPARSE
     map->clearCacheMark();
 #endif
@@ -614,6 +660,13 @@ uint64_t AdrenoMemoryMap::physicalPage(void *ctx, uint64_t offset, uint64_t *len
 {
     auto *map = static_cast<AdrenoMemoryMap *>(ctx);
     IOByteCount span = 0;
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    if (map->fBackingHead) {   // map offset m holds descriptor byte m - head; whole pages at both ends
+        const uint64_t pa = map->fBacking->getPhysicalSegment(adreno_head_descriptor_offset(offset, map->fBackingHead),
+                                                              &span, kIOMemoryMapperNone);
+        return adreno_head_run(offset, map->fBackingHead, map->fBackingBytes, pa, span, length);
+    }
+#endif
     uint64_t pa = map->fBacking->getPhysicalSegment(offset, &span, kIOMemoryMapperNone);
 #if ADRENO_RESIDENT_REPIN
     // A short backing's last run goes on to the end of its page, which the wire holds whole.
@@ -835,7 +888,7 @@ bool AdrenoMemoryMap::commitIntoGPUPageTable()
     return error == 0;
 #endif
 }
-// The re-pin's refusal state and report, in order (src/AdrenoMemoryMap/).
+// The re-pin's refusal state and report, and the head rule, in order (src/AdrenoMemoryMap/).
 #include "AdrenoMemoryMap/repin.cpp"
 void AdrenoMemoryMap::releaseFromGPUPageTable()
 {
