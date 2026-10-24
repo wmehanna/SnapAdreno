@@ -128,6 +128,15 @@
 #if ADRENO_PRESENT_RELATCH && (!ADRENO_LATCH || !ADRENO_PIPELINE)
 #error "ADRENO_PRESENT_RELATCH needs ADRENO_LATCH (the GO's frame) and ADRENO_PIPELINE (the marks it waits for)"
 #endif
+// IOMFB call trace (agents/display-modeset): -DADRENO_DISPLAY_TRACE_MODES=1 here only. Every IOMFB mode, timing, colour,
+// brightness, block, parameter and property call a client makes is forwarded unchanged to the family's implementation
+// (or this class's own) and logged with its arguments and result, the first 8 of each kind and then every 256th; a
+// layer-0 swap whose source, destination or surface is not the panel's 2880x1800 is logged the same way; and each perf
+// window adds one "AdrenoDisplay: iomfb" line with that window's calls by kind (src/AdrenoDisplay/trace.cpp). Logging
+// only: no call's behaviour or result changes. Off by default; without it this source compiles as before.
+#ifndef ADRENO_DISPLAY_TRACE_MODES
+#define ADRENO_DISPLAY_TRACE_MODES 0
+#endif
 #include "IOMobileGraphicsFamily26A428.h"
 #include "AdrenoDisplayPresent.h"
 #if ADRENO_PERF_FRAMES
@@ -205,8 +214,45 @@ public:
     virtual IOReturn surface_layer_map(IOMFB::AP::DisplayedData *data, unsigned int layer,
                                        IOSurface *surface) APPLE_KEXT_OVERRIDE;
     virtual void surface_layer_unmap(IOMFB::AP::DisplayedData *data, unsigned int layer) APPLE_KEXT_OVERRIDE;
+#if ADRENO_DISPLAY_TRACE_MODES
+    // The IOMFB call trace (AdrenoDisplay/trace.cpp): each logs and forwards to IOMobileFramebufferLegacy unchanged.
+    // Declared exactly as the introducing class declares them (IOMobileGraphicsFamily26A428.h), so each keeps its slot
+    // and PAC diversity; tools/check-iomfb-vtable.py checks the built object.
+    virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                                   IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+    using IOMobileFramebufferLegacy::newUserClient;
+    virtual IOReturn set_display_device(unsigned int a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_digital_out_state(unsigned int *a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_canvas_size(unsigned int a0, unsigned int a1) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_gamma_table(IOMFBGammaTable *a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_gamma_table(IOMFBGammaTable *a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_matrix(unsigned int a0, unsigned long long (*a1)[3][3]) const APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_matrix(unsigned int a0, unsigned long long const (*a1)[3][3]) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_contrast(float *a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_white_on_black_mode(unsigned int a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_color_remap_mode(DisplayColorRemapMode a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_color_remap_mode(DisplayColorRemapMode *a0) const APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setBrightnessCorrection(unsigned int a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn splc_set_brightness(unsigned int a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn splc_get_brightness(unsigned int *a0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3, unsigned int a4,
+                               unsigned char const *a5, unsigned long a6) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3, unsigned int a4,
+                               unsigned char *a5, unsigned long a6) const APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_block_size(task *a0, unsigned int a1, unsigned int *a2) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn swap_set_color_matrix(IOMFBColorFixedMatrix *a0, IOMFBColorMatrixFunction a1,
+                                           unsigned int a2) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn set_parameter(IOMFBParameterName a0, unsigned long long const *a1, unsigned int a2) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn enable_disable_dithering(unsigned int a0) APPLE_KEXT_OVERRIDE;
+#endif
 
 private:
+#if ADRENO_DISPLAY_TRACE_MODES
+    IOReturn digitalOutMode(unsigned int colorID, unsigned int timingID);   // set_digital_out_mode's body (modeset.cpp)
+    void traceSwapGeometryGated(IOSurface *surface);   // presentGated: a layer-0 swap that is not the panel's geometry
+    void traceWindowGated();                           // perfLineGated: this window's calls by kind
+#endif
     bool cleanQueueGated();
     void presentGated(IOMFBSwapIORequest *swap);
     void vsyncGated(IOTimerEventSource *sender);

@@ -23,10 +23,19 @@ Without `PROFILE` the build is unchanged.
 | Profile | Configuration |
 | --- | --- |
 | `desktop` | The A16 desktop kext with IO-coherent maintenance skipping (`ADRENO_COHERENT_SKIP_MAINT`). Needs a `--gpu-coherent` monitor and the boot-arg `adreno_coherent=1` to skip anything. |
-| `desktop-nocoherent` | The same without coherency: sparse maintenance, the IB pipeline, GPU recovery, the present relatch, resident re-pin and aligned live-scanout copies. |
+| `desktop-nocoherent` | The same without coherency: sparse maintenance, the IB pipeline, GPU recovery, the present relatch, resident re-pin, the head rule, the IOMFB call trace and aligned live-scanout copies. |
 
 Built from the commit that added them, the profiles match their deployed kexts section for section (the umbrella's
-`tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both. The file bytes also
+`tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both. Since then both
+profiles also build two options; without those two words they are the earlier kexts section for section:
+- `ADRENO_RESIDENT_HEAD_OFFSET` (every unit, needs `ADRENO_RESIDENT_REPIN`): a client buffer at a page-unaligned
+  address is mapped in whole pages instead of refused. Opening System Settings > Displays made WindowServer create
+  one, and every composite that listed it then failed (the desktop showed alternating stale frames). Boot-arg
+  `adreno_head_offset=0` refuses such buffers again. Rules and their host model: the umbrella's
+  `compat/adreno-resource-tail.h` and `tools/test-adreno-residency.py` (`HeadOffset`).
+- `ADRENO_DISPLAY_TRACE_MODES` (`AdrenoDisplay.o`): every IOMFB mode, colour, brightness, block, parameter and
+  property call is logged (`AdrenoDisplay: iomfb ...`, rate-limited) and forwarded unchanged, with one
+  `AdrenoDisplay: iomfb s=<window>` line per perf window. Logging only. The file bytes also
 carry object paths, object times and a UUID; with `ZERO_AR_DATE=1` two builds in the same checkout are byte-identical.
 
 Licence: the source here is MIT (see `LICENSE`). The build also compiles the umbrella's

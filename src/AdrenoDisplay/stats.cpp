@@ -280,6 +280,9 @@ void AdrenoDisplay::perfLineGated(const char *why)
           now.refreshed - fPerfMark.refreshed, fLastCacheMode, fSourceAttr, build, sourceCached, conv[0], conv[1],
           conv[2], conv[3], conv[4], fCopyErrors, fLastCopyError);
 #endif
+#if ADRENO_DISPLAY_TRACE_MODES
+    traceWindowGated();
+#endif
     fPerfMark = now;
     fPerfMaxTicks = 0;
 }

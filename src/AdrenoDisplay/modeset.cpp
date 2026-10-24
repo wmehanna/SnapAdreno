@@ -186,7 +186,11 @@ void AdrenoDisplay::stop_hardware_gated()
     withdrawDisplayAttributes();
 }
 
+#if ADRENO_DISPLAY_TRACE_MODES
+IOReturn AdrenoDisplay::digitalOutMode(unsigned int colorID, unsigned int timingID)   // traced by set_digital_out_mode
+#else
 IOReturn AdrenoDisplay::set_digital_out_mode(unsigned int colorID, unsigned int timingID)
+#endif
 {
     // The native API and selector23 pass color first, timing second. Four
     // generation55 WindowServer corpses retain the request (100, 1000).

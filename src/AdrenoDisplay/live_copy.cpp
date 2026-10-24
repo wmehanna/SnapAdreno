@@ -30,6 +30,9 @@ void AdrenoDisplay::presentGated(IOMFBSwapIORequest *swap)
         // region has no 26A428 producer (IOMobileGraphicsFamily26A428.h, kDirtyValid).
         fLastSrc = IOMFBSwapFields::srcRect(swap, 0);
         fLastDst = IOMFBSwapFields::dstRect(swap, 0);
+#if ADRENO_DISPLAY_TRACE_MODES
+        traceSwapGeometryGated(surface);
+#endif
         if (IOMFBSwapFields::dirtyValid(swap)) {
             fSwapDirtyFlagged++;
             fSwapDirty = IOMFBSwapFields::dirtyRect(swap);
