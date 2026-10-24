@@ -37,7 +37,7 @@ int AdrenoSegmentList::prepareResource(void *, void *resource, void **token)
     map->retain();
 #if ADRENO_RESIDENT_REPIN
     if (!map->prepareForSubmission()) {
-        map->reportRefused(resource);   // agents/resident-evict: once per map, with pid, IOSurface and lengths
+        map->reportRefused(resource);   // agents/resident-evict: once per map, with IOSurface and lengths
         map->release();
         return -1;
     }

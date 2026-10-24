@@ -26,9 +26,8 @@ static uint32_t repinLogDue(uint32_t *logged)
     uint32_t n = __atomic_add_fetch(logged, 1, __ATOMIC_RELAXED);
     return n <= 16 || !(n & 1023) ? n : 0;
 }
-// IOGPUFamily 26A428 exports: IOGPUTask::getProcessIDAndName (0x464b0: proc_pid and proc_name of the task at +0x28),
-// IOGPUResource::getIOSurface, IOSurface::getSurfaceID (both already imported by --present-sync).
-extern "C" int AdrenoRepinTaskPidName(const void *, char *, int) __asm__("__ZNK9IOGPUTask19getProcessIDAndNameEPci");
+// IOGPUFamily 26A428 exports IOGPUResource::getIOSurface and IOSurface::getSurfaceID (both already imported by
+// --present-sync).
 extern "C" void *AdrenoRepinResourceIOSurface(const void *) __asm__("__ZNK13IOGPUResource12getIOSurfaceEv");
 extern "C" uint32_t AdrenoRepinIOSurfaceID(const void *) __asm__("__ZNK9IOSurface12getSurfaceIDEv");
 #endif
@@ -859,14 +858,13 @@ void AdrenoMemoryMap::reportRefused(const void *resource)
     if (!first) return;
     const uint64_t n = __atomic_add_fetch(&gRepin[kRepinReports], 1, __ATOMIC_RELAXED);
     if (n > 32 && (n & 255)) return;
-    // The map's IOGPUTask (IOGPUMemoryMap::init 0x54ac0 stores it, retained, at +0x20); the caller holds the map.
-    const void *task = *reinterpret_cast<const void *const *>(reinterpret_cast<const uint8_t *>(this) + 0x20);
-    char name[33] = {};
-    const int pid = task ? AdrenoRepinTaskPidName(task, name, sizeof(name)) : -1;
+    // No owning process here: IOGPU exposes no accessor for a map's IOGPUTask, and reading it from IOGPUMemoryMap's
+    // private layout would call through whatever a different IOGPUFamily build keeps at that offset, on a path any
+    // client's submission reaches. The IOSurface ID and the map's own fields identify the buffer.
     const void *surface = resource ? AdrenoRepinResourceIOSurface(resource) : nullptr;
     const uint32_t surfaceID = surface ? AdrenoRepinIOSurfaceID(surface) : 0;
-    MLOG("unadmitted map refused a submission: pid %d (%s) IOSurface %u address=0x%llx length=0x%llx descriptor=0x%llx "
-         "flags=0x%x refusal %d native=0x%x; maps tail %llu refused %llu retried %llu recovered %llu (%llu)", pid, name,
+    MLOG("unadmitted map refused a submission: IOSurface %u address=0x%llx length=0x%llx descriptor=0x%llx "
+         "flags=0x%x refusal %d native=0x%x; maps tail %llu refused %llu retried %llu recovered %llu (%llu)",
          surfaceID, address, length, descriptor, flags, refusal, status,
          __atomic_load_n(&gRepin[kRepinTail], __ATOMIC_RELAXED), __atomic_load_n(&gRepin[kRepinRefused], __ATOMIC_RELAXED),
          __atomic_load_n(&gRepin[kRepinRetried], __ATOMIC_RELAXED),

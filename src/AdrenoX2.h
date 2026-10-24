@@ -84,7 +84,7 @@ extern "C" void AdrenoPresentSyncCounters(uint64_t *marks, uint64_t *overflows, 
 // less than a page (IOGPU's page-rounded memory length; compat/adreno-resource-tail.h) is pinned and mapped in whole
 // pages instead of refused on every commit; a commit that is refused cleanly (nothing pinned or mapped) no longer fails
 // the other maps of its memory: it is reported committed, the map stays unadmitted, its own submissions retry the pin
-// under their native preparation and are refused cleanly, reported once per map (pid, IOSurface, lengths); boot-arg
+// under their native preparation and are refused cleanly, reported once per map (IOSurface, lengths); boot-arg
 // adreno_resident_mib sets the residency budget. Off by default; without it this source compiles as before.
 #ifndef ADRENO_RESIDENT_REPIN
 #define ADRENO_RESIDENT_REPIN 0
