@@ -25,8 +25,9 @@ Without `PROFILE` the build is unchanged.
 | `desktop` | The A16 desktop kext with IO-coherent maintenance skipping (`ADRENO_COHERENT_SKIP_MAINT`). Needs a `--gpu-coherent` monitor and the boot-arg `adreno_coherent=1` to skip anything. |
 | `desktop-nocoherent` | The same without coherency: sparse maintenance, the IB pipeline, GPU recovery, the present relatch, resident re-pin and aligned live-scanout copies. |
 
-A profile build matches its deployed kext section for section (the umbrella's `tools/macho-sections.py`). The
-file bytes also carry object paths and a UUID, so they differ between checkouts.
+Built from the commit that added them, the profiles match their deployed kexts section for section (the umbrella's
+`tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both. The file bytes also
+carry object paths, object times and a UUID; with `ZERO_AR_DATE=1` two builds in the same checkout are byte-identical.
 
 Licence: the source here is MIT (see `LICENSE`). The build also compiles the umbrella's
 `compat/adreno-ib-tables.h`, which is GPL-2.0-only, so a built kext is a combined work distributable under

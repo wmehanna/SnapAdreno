@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Sourced by build.sh (PROFILE=desktop-nocoherent). The A16 desktop's AdrenoX2 before IO-coherent leaves: the
-# configuration of AdrenoX2 981e0b88 (AuxKC 43bed810, booted from b12v19c through b12v20). Section for section equal to
-# that kext (compare with tools/macho-sections.py in the umbrella; the file bytes also carry object paths and a UUID).
+# configuration of AdrenoX2 981e0b88 (AuxKC 43bed810, booted from b12v19c through b12v20). Built from the sources of
+# the commit that added this profile it is section for section that kext (the umbrella's tools/macho-sections.py; the
+# file bytes also carry object paths and a UUID). Since the re-pin log stopped reading the map's IOGPUTask from a
+# private offset, AdrenoMemoryMap.o differs from it, and with it the linked kext's code and data addresses.
 #
 # Every define is named per unit, so build.sh's FIXES is cleared. The sets, unit by unit:
 #   AdrenoX2           frame and GPU perf windows, the 512 MiB residency default, asynchronous IBs, the present latch
