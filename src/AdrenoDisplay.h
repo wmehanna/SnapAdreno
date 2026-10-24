@@ -128,6 +128,13 @@
 #if ADRENO_PRESENT_RELATCH && (!ADRENO_LATCH || !ADRENO_PIPELINE)
 #error "ADRENO_PRESENT_RELATCH needs ADRENO_LATCH (the GO's frame) and ADRENO_PIPELINE (the marks it waits for)"
 #endif
+// --edp-backlight (agents/brightness): -DADRENO_BACKLIGHT=1 publishes AdrenoBacklight (AdrenoBacklight.h), the panel's
+// backlight service for CoreBrightness, which sets the panel's DPCD brightness through the monitor's
+// ADRENO_GUEST_BACKLIGHT (-DSNAP_EDP_BACKLIGHT=1). Needs boot-arg adreno_backlight=1 at run time too. Off by default;
+// without it this source compiles as before.
+#ifndef ADRENO_BACKLIGHT
+#define ADRENO_BACKLIGHT 0
+#endif
 #include "IOMobileGraphicsFamily26A428.h"
 #include "AdrenoDisplayPresent.h"
 #if ADRENO_PERF_FRAMES
@@ -156,6 +163,9 @@
 // adreno_display=0/1 forces it off/on. Returns false (and leaves the accelerator
 // untouched) when not created or when the display fails to start. Never fatal.
 bool AdrenoDisplayAttach(IOService *accelerator);
+#if ADRENO_BACKLIGHT
+class AdrenoBacklight;
+#endif
 
 class AdrenoDisplay : public IOMobileFramebufferLegacy
 {
@@ -205,8 +215,17 @@ public:
     virtual IOReturn surface_layer_map(IOMFB::AP::DisplayedData *data, unsigned int layer,
                                        IOSurface *surface) APPLE_KEXT_OVERRIDE;
     virtual void surface_layer_unmap(IOMFB::AP::DisplayedData *data, unsigned int layer) APPLE_KEXT_OVERRIDE;
+#if ADRENO_BACKLIGHT
+    // Slot 397 (KDK 26A428: vtable +0xc68, diversity 0x05d1), reached from set_parameter name 1 (backlight.cpp).
+    virtual IOReturn set_brightness_gated(int value) APPLE_KEXT_OVERRIDE;
+#endif
 
 private:
+#if ADRENO_BACKLIGHT
+    void backlightAttach();
+    void backlightDetach();
+    AdrenoBacklight *fBacklight;           // the published backlight service, or null (no service: brightness unchanged)
+#endif
     bool cleanQueueGated();
     void presentGated(IOMFBSwapIORequest *swap);
     void vsyncGated(IOTimerEventSource *sender);

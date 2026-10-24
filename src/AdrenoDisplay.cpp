@@ -17,6 +17,11 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <uuid/uuid.h>
+#if ADRENO_BACKLIGHT
+#include "AdrenoBacklight.h"
+#include "../../../../compat/adreno-guest.h"
+#include "../../../../compat/edp-backlight.h"
+#endif
 
 extern "C" task_t kernel_task;
 #if ADRENO_PERF_FRAMES
@@ -179,16 +184,29 @@ bool AdrenoDisplay::start(IOService *provider)
     // (updateCursorGated); 2 and 3 are accepted too.
     setProperty("CursorPlane", 1ULL, 32);
     fSwapInfoHead = fSwapInfoTail = 0;
+#if ADRENO_BACKLIGHT
+    if (!super::start(provider))
+        return false;
+    backlightAttach();   // never fatal: without a service the panel keeps the firmware's brightness
+    return true;
+#else
     return super::start(provider);
+#endif
 }
 
 void AdrenoDisplay::stop(IOService *provider)
 {
+#if ADRENO_BACKLIGHT
+    backlightDetach();
+#endif
     super::stop(provider);
 }
 
 void AdrenoDisplay::free()
 {
+#if ADRENO_BACKLIGHT
+    OSSafeReleaseNULL(fBacklight);
+#endif
     OSSafeReleaseNULL(fColorElements);
     OSSafeReleaseNULL(fTimingElements);
     releaseSurfaceMaps();
@@ -315,3 +333,6 @@ bool AdrenoDisplay::are_timings_enabled() const
 #include "AdrenoDisplay/modeset.cpp"
 #include "AdrenoDisplay/frame_latch.cpp"
 #include "AdrenoDisplay/attributes.cpp"
+#if ADRENO_BACKLIGHT
+#include "AdrenoDisplay/backlight.cpp"
+#endif
