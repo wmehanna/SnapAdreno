@@ -357,7 +357,7 @@ void AdrenoBacklight::publish()
         putNum(diag, "Max", fMax) && putNum(diag, "Level", fLevel) && putNum(diag, "Bits", fBits) &&
         putNum(diag, "LSB", fLsb) && putNum(diag, "Mode", fModeReg) &&
         putNum(diag, "DPCD700", (uint32_t)fCaps[0] | (uint32_t)fCaps[1] << 8 | (uint32_t)fCaps[2] << 16 |
-                                (uint32_t)fCaps[3] << 24) &&
+                                (uint32_t)fCaps[3] << 24, 64) &&
         putNum(diag, "RequestsNits", requests[kSourceNits], 64) &&
         putNum(diag, "RequestsBrightness", requests[kSourceSlider], 64) &&
         putNum(diag, "RequestsIOMFB", requests[kSourceIOMFB], 64) && putNum(diag, "Applied", applied, 64) &&
