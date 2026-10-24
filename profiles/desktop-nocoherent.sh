@@ -10,17 +10,20 @@
 #                      and present sync
 #   AdrenoMemoryMap    the resource pool and its arena, the residency default, GPU perf, VA reclaim
 #   AdrenoDisplay      cached reads, frame perf, the pool, 60 Hz vsync, GPU perf, the beam, the cursor stage, the
-#                      present-maintenance skip, VA reclaim, the latch and present sync
+#                      present-maintenance skip, VA reclaim, the latch, present sync and the IOMFB call trace
 #   adreno-resource    the pool, its arena and VA reclaim
 # and every one of those eight units (with AdrenoSegmentList, adreno-resource-list, adreno-fill-command and
 # adreno-ib-command) also gets PROFILE_ALL: sparse cache maintenance, GPU perf, the wide GPU VA window, the IB
-# pipeline, GPU recovery, the present relatch, resident re-pin and aligned live-scanout copies.
+# pipeline, GPU recovery, the present relatch, resident re-pin, the head rule and aligned live-scanout copies.
+# The head rule (-DADRENO_RESIDENT_HEAD_OFFSET=1) and the IOMFB call trace (-DADRENO_DISPLAY_TRACE_MODES=1), both
+# agents/display-modeset, came after both reproduced kexts: with them the profile builds the next desktop kext, without
+# them (drop the two words) the one described above.
 # SnapintoshVirtualEthernet, AdrenoEarlyStop, adreno-submit and kmod_info take no feature define.
 FIXES=
-PROFILE_ALL="-DADRENO_CACHE_SPARSE=1 -DADRENO_PERF_GPU=1 -DADRENO_VA_WIDE=1 -DADRENO_PIPELINE=1 -DADRENO_GPU_RECOVER=1 -DADRENO_PRESENT_RELATCH=1 -DADRENO_RESIDENT_REPIN=1 -DADRENO_PRESENT_LIVE_ALIGNED=1"
+PROFILE_ALL="-DADRENO_CACHE_SPARSE=1 -DADRENO_PERF_GPU=1 -DADRENO_VA_WIDE=1 -DADRENO_PIPELINE=1 -DADRENO_GPU_RECOVER=1 -DADRENO_PRESENT_RELATCH=1 -DADRENO_RESIDENT_REPIN=1 -DADRENO_RESIDENT_HEAD_OFFSET=1 -DADRENO_PRESENT_LIVE_ALIGNED=1"
 U_AdrenoX2="-DADRENO_PERF_FRAMES=1 -DADRENO_RESIDENT_BUDGET_MIB=512 -DADRENO_PERF_GPU=1 -DADRENO_IB_ASYNC=1 -DADRENO_LATCH=1 -DADRENO_PRESENT_SYNC=1 $PROFILE_ALL"
 U_AdrenoMemoryMap="-DADRENO_RESOURCE_POOL=1 -DADRENO_POOL_ARENA=1 -DADRENO_RESIDENT_BUDGET_MIB=512 -DADRENO_PERF_GPU=1 -DADRENO_VA_RECLAIM=1 $PROFILE_ALL"
-U_AdrenoDisplay="-DADRENO_PRESENT_CACHED_READ=1 -DADRENO_PERF_FRAMES=1 -DADRENO_RESOURCE_POOL=1 -DADRENO_VSYNC60=1 -DADRENO_PERF_GPU=1 -DADRENO_BEAM=1 -DADRENO_PRESENT_CURSOR_STAGE=1 -DADRENO_PRESENT_SKIP_MAINT=1 -DADRENO_VA_RECLAIM=1 -DADRENO_LATCH=1 -DADRENO_PRESENT_SYNC=1 $PROFILE_ALL"
+U_AdrenoDisplay="-DADRENO_PRESENT_CACHED_READ=1 -DADRENO_PERF_FRAMES=1 -DADRENO_RESOURCE_POOL=1 -DADRENO_VSYNC60=1 -DADRENO_PERF_GPU=1 -DADRENO_BEAM=1 -DADRENO_PRESENT_CURSOR_STAGE=1 -DADRENO_PRESENT_SKIP_MAINT=1 -DADRENO_VA_RECLAIM=1 -DADRENO_LATCH=1 -DADRENO_PRESENT_SYNC=1 -DADRENO_DISPLAY_TRACE_MODES=1 $PROFILE_ALL"
 U_AdrenoSegmentList="$PROFILE_ALL"
 U_adreno_resource="-DADRENO_RESOURCE_POOL=1 -DADRENO_POOL_ARENA=1 -DADRENO_VA_RECLAIM=1 $PROFILE_ALL"
 U_adreno_resource_list="$PROFILE_ALL"
