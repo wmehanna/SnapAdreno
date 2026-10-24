@@ -11,8 +11,11 @@
 // AdrenoDisplay::set_brightness_gated (IOMobileFramebufferSetParameter name 1) forwards its value here as 16.16 nits
 // (INFERRED units).
 //
-// The panel is never touched from here: each change becomes a level for the EL2 monitor's ADRENO_GUEST_BACKLIGHT
-// (compat/edp-backlight.h), which clamps it to the panel's [floor, max] and writes DPCD 0x722/0x723. Nothing is
+// Nits become a panel level with compat/edp-backlight.h's luminance model (luminance proportional to level, the top
+// level = boot-arg adreno_backlight_max_nits, default 500), never below the darkest offer (boot-arg
+// adreno_backlight_min_nits, default 5, raised to what the monitor's floor shows). The panel is never touched from
+// here: the level goes to the EL2 monitor's ADRENO_GUEST_BACKLIGHT, which clamps it to the panel's [floor, max] and
+// writes DPCD 0x722/0x723. Nothing is
 // written at start: the firmware's brightness stays until macOS asks. Requests are coalesced on the service's own
 // work loop, at most one monitor call per kMinIntervalMs; the latest request wins. A monitor that refuses
 // (an older one, a panel without AUX brightness, or one that stopped after failures) leaves the brightness as it was:
@@ -53,7 +56,8 @@ private:
     uint8_t fCaps[4], fModeReg;
     bool fLsb;
     bool fAllowMode;              // boot-arg adreno_backlight_mode=1: allow the DPCD mode switch
-    uint32_t fMinNits, fMaxNits;  // the nominal range CoreBrightness sees (BrightnessMilliNits min/max)
+    uint32_t fMinNits, fMaxNits;  // boot-args (or defaults): the darkest request and the top level's luminance
+    uint64_t fMinQ16;             // BrightnessMilliNits "min" in 16.16: fMinNits, raised to the floor's luminance
     // Under fLock.
     bool fPending, fArmed, fStopped;
     uint32_t fPendingLevel;

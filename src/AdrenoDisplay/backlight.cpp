@@ -121,10 +121,11 @@ AdrenoBacklight *AdrenoBacklight::create(IOService *display)
         return nullptr;
     }
     b->registerService();
-    IOLog("AdrenoBacklight: published (backlight-control): %u..%u nits onto levels %u..%u, panel level %u (%llu "
-          "nits)%s\n", b->fMinNits, b->fMaxNits, b->fFloor, b->fMax, b->fLevel,
-          edp_bl_level_to_nits(b->fLevel, b->fMinNits, b->fMaxNits, b->fFloor, b->fMax) >> 16,
-          state == EDP_BL_STATE_MODE ? "; the first change switches the panel to DPCD mode" : "");
+    uint64_t now = edp_bl_level_to_nits(b->fLevel, b->fMaxNits, b->fMax);
+    IOLog("AdrenoBacklight: published (backlight-control): %llu.%03llu..%u nits, level = "
+          "nits * %u / %u in levels %u..%u, panel level %u (%llu.%03llu nits)%s\n", b->fMinQ16 >> 16,
+          milli(b->fMinQ16 & 0xffff), b->fMaxNits, b->fMax, b->fMaxNits, b->fFloor, b->fMax, b->fLevel, now >> 16,
+          milli(now & 0xffff), state == EDP_BL_STATE_MODE ? "; the first change switches the panel to DPCD mode" : "");
     return b;
 }
 
@@ -150,6 +151,8 @@ bool AdrenoBacklight::configure(uint64_t x1, uint64_t x2, uint64_t x3)
         fMinNits = EDP_BL_NITS_MIN_DEFAULT;
         fMaxNits = EDP_BL_NITS_MAX_DEFAULT;
     }
+    // Stays below the top level's luminance: fFloor < fMax (checked above) and fMinNits < fMaxNits.
+    fMinQ16 = edp_bl_min_nits_q16(fMinNits, fMaxNits, fFloor, fMax);
     fLock = IOLockAlloc();
     fWorkLoop = IOWorkLoop::workLoop();
     if (!fLock || !fWorkLoop)
@@ -166,12 +169,12 @@ bool AdrenoBacklight::start(IOService *provider)
     // The keys CoreBrightness and BrightnessControl read from a backlight service (AdrenoBacklight.h). The 16.16
     // luminance products are the J700 backlight node's property names; their values are this panel's nominal range,
     // its mid point CoreBrightness's usual 140 nits (INFERRED).
-    uint32_t mid = 140;
-    mid = mid < fMinNits ? fMinNits : mid > fMaxNits ? fMaxNits : mid;
+    uint64_t mid = 140ull << 16, top = (uint64_t)fMaxNits << 16;
+    mid = mid < fMinQ16 ? fMinQ16 : mid > top ? top : mid;
     setProperty("backlight-control", kOSBooleanTrue);
-    setProperty("LminProduct", (unsigned long long)fMinNits << 16, 32);
-    setProperty("LmidProduct", (unsigned long long)mid << 16, 32);
-    setProperty("LmaxProduct", (unsigned long long)fMaxNits << 16, 32);
+    setProperty("LminProduct", (unsigned long long)fMinQ16, 32);
+    setProperty("LmidProduct", (unsigned long long)mid, 32);
+    setProperty("LmaxProduct", (unsigned long long)top, 32);
     publish();
     return true;
 }
@@ -215,13 +218,15 @@ IOReturn AdrenoBacklight::setProperties(OSObject *properties)
     }
     n = OSDynamicCast(OSNumber, d->getObject("brightness"));
     if (n)
-        return requestNits(edp_bl_slider_to_nits(n->unsigned64BitValue(), fMinNits, fMaxNits), kSourceSlider);
+        return requestNits(edp_bl_slider_to_nits(n->unsigned64BitValue(), fMinQ16, (uint64_t)fMaxNits << 16),
+                           kSourceSlider);
     return kIOReturnUnsupported;
 }
 
 IOReturn AdrenoBacklight::requestNits(uint64_t nits_q16, Source source)
 {
-    uint32_t level = edp_bl_nits_to_level(nits_q16, fMinNits, fMaxNits, fFloor, fMax);
+    // The darkest offer bounds every source, so adreno_backlight_min_nits also holds for set_parameter and "brightness".
+    uint32_t level = edp_bl_nits_to_level(nits_q16 < fMinQ16 ? fMinQ16 : nits_q16, fMaxNits, fFloor, fMax);
     uint64_t interval, last;
     IOLockLock(fLock);
     if (fStopped) {
@@ -309,13 +314,14 @@ void AdrenoBacklight::apply(IOTimerEventSource *)
 // or failed request shows), and the diagnostics a run's ioreg captures.
 void AdrenoBacklight::publish()
 {
-    uint64_t q = edp_bl_level_to_nits(fLevel, fMinNits, fMaxNits, fFloor, fMax);
+    uint64_t top = (uint64_t)fMaxNits << 16, q = edp_bl_level_to_nits(fLevel, fMaxNits, fMax);
+    q = q < fMinQ16 ? fMinQ16 : q > top ? top : q;
     OSDictionary *params = OSDictionary::withCapacity(2), *slider = OSDictionary::withCapacity(3),
                  *nits = OSDictionary::withCapacity(3), *diag = OSDictionary::withCapacity(16);
     bool ok = params && slider && nits && diag && putNum(slider, "min", 0) &&
               putNum(slider, "max", EDP_BL_SLIDER_MAX) &&
-              putNum(slider, "value", edp_bl_nits_to_slider(q, fMinNits, fMaxNits)) &&
-              putNum(nits, "min", (uint64_t)fMinNits * 1000) && putNum(nits, "max", (uint64_t)fMaxNits * 1000) &&
+              putNum(slider, "value", edp_bl_nits_to_slider(q, fMinQ16, top)) &&
+              putNum(nits, "min", milli(fMinQ16)) && putNum(nits, "max", (uint64_t)fMaxNits * 1000) &&
               putNum(nits, "value", milli(q));
     if (ok) {   // putDict consumes its dictionary either way
         ok = putDict(params, "brightness", slider);
