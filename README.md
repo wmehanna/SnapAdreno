@@ -24,6 +24,7 @@ Without `PROFILE` the build is unchanged.
 | --- | --- |
 | `desktop` | The A16 desktop kext with IO-coherent maintenance skipping (`ADRENO_COHERENT_SKIP_MAINT`). Needs a `--gpu-coherent` monitor and the boot-arg `adreno_coherent=1` to skip anything. |
 | `desktop-nocoherent` | The same without coherency: sparse maintenance, the IB pipeline, GPU recovery, the present relatch, resident re-pin and aligned live-scanout copies. |
+| `desktop-backlight` | `desktop` plus the panel backlight service (`ADRENO_BACKLIGHT`, `src/AdrenoBacklight.h`) in `AdrenoDisplay.o`. Needs a monitor built with the umbrella's `SNAP_EDP_BACKLIGHT` and the boot-arg `adreno_backlight=1`; otherwise it behaves as `desktop`. Not deployed yet. |
 
 Built from the commit that added them, the profiles match their deployed kexts section for section (the umbrella's
 `tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both. The file bytes also
