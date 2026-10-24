@@ -27,8 +27,9 @@ Without `PROFILE` the build is unchanged.
 | `desktop-backlight` | `desktop` plus the panel backlight service (`ADRENO_BACKLIGHT`, `src/AdrenoBacklight.h`) in `AdrenoDisplay.o`. Needs a monitor built with the umbrella's `SNAP_EDP_BACKLIGHT` and the boot-arg `adreno_backlight=1`; otherwise it behaves as `desktop`. Not deployed yet. |
 
 Built from the commit that added them, the profiles match their deployed kexts section for section (the umbrella's
-`tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both. Since then both
-profiles also build two options; without those two words they are the earlier kexts section for section:
+`tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both, and the
+`ADRENO_IB_CS_SAMPLERS` opt-in below changes `AdrenoX2.o` and `adreno-ib-command.o`. Both profiles also build two
+display-path options; without those two words each builds what it did before them, section for section:
 - `ADRENO_RESIDENT_HEAD_OFFSET` (every unit, needs `ADRENO_RESIDENT_REPIN`): a client buffer at a page-unaligned
   address is mapped in whole pages instead of refused. Opening System Settings > Displays made WindowServer create
   one, and every composite that listed it then failed (the desktop showed alternating stale frames). Boot-arg
@@ -38,6 +39,12 @@ profiles also build two options; without those two words they are the earlier ke
   property call is logged (`AdrenoDisplay: iomfb ...`, rate-limited) and forwarded unchanged, with one
   `AdrenoDisplay: iomfb s=<window>` line per perf window. Logging only. The file bytes also
 carry object paths, object times and a UUID; with `ZERO_AR_DATE=1` two builds in the same checkout are byte-identical.
+
+`ADRENO_IB_CS_SAMPLERS` (in both profiles, in `AdrenoX2` and `adreno-ib-command`) lets the IB validator admit CS
+sampler loads of up to 8 units, which CoreImage's multi-input kernels need (the folder, document and Safari icons in
+System Settings panes), and publishes `AdrenoIBComputeSamplers` so an `ADRENO_SETTINGS_ICONS` plug-in encodes them.
+Both happen only when the guest boots with `adreno_cs_samplers=1`; without it the kext validates and publishes exactly
+what a build without the define does.
 
 Licence: the source here is MIT (see `LICENSE`). The build also compiles the umbrella's
 `compat/adreno-ib-tables.h`, which is GPL-2.0-only, so a built kext is a combined work distributable under

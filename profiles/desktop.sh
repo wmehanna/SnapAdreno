@@ -2,7 +2,8 @@
 # Sourced by build.sh (PROFILE=desktop). The A16 desktop's AdrenoX2: desktop-nocoherent plus IO-coherent maintenance
 # skipping (-DADRENO_COHERENT_SKIP_MAINT=1) in the same eight units. The configuration of AdrenoX2 c66edb6b (AuxKC
 # bd057773, booted in b12v23 with the monitor's --gpu-coherent). Built from the sources of the commit that added this
-# profile it is section for section that kext; since then only the re-pin log fix (AdrenoMemoryMap.o) differs.
+# profile it is section for section that kext; since then the re-pin log fix (AdrenoMemoryMap.o) and the inert
+# ADRENO_IB_CS_SAMPLERS opt-in (AdrenoX2.o, adreno-ib-command.o; see desktop-nocoherent.sh) differ.
 #
 # The kext skips CPU cache maintenance only after the monitor's ADRENO_GUEST_COHERENT answers ON and the guest
 # boot-arg adreno_coherent=1 is set; with an older monitor, or without the boot-arg, it maintains as desktop-nocoherent.

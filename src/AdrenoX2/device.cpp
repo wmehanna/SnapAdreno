@@ -321,6 +321,21 @@ void AdrenoAcceleratorX2::configureGuestIB(IOService *provider)
         if (releaseIBArena()) freeIBWork();   // refused, or retired and idle: the arena is not referenced
         return;
     }
+#if ADRENO_IB_CS_SAMPLERS
+    // CoreImage's multi-input kernels (the folder, document and Safari icons in System Settings panes) load one S# per
+    // sampled input, more than the single CS sampler unit the validator has always admitted. Only with the boot-arg
+    // adreno_cs_samplers=1 does the validator admit up to ADRENO_IB_CS_SAMPLER_UNITS_MAX and the registry say so; an
+    // ADRENO_SETTINGS_ICONS plug-in encodes those kernels only when it reads AdrenoIBComputeSamplers. Both happen here,
+    // in configureDevice, before start registers the accelerator and before ADRENO_IB_REGISTRY_PROPERTY: no client can
+    // submit an IB, or see the IB path, before the limit is final. Without the boot-arg nothing differs from a build
+    // without ADRENO_IB_CS_SAMPLERS.
+    uint32_t csSamplers = 0;
+    if (PE_parse_boot_argn("adreno_cs_samplers", &csSamplers, sizeof(csSamplers)) && csSamplers) {
+        adreno_ib_set_cs_sampler_units(ADRENO_IB_CS_SAMPLER_UNITS_MAX);
+        setProperty("AdrenoIBComputeSamplers", (unsigned long long)ADRENO_IB_CS_SAMPLER_UNITS_MAX, 32);
+        ALOG("IB: CS sampler loads of up to %u units admitted (adreno_cs_samplers)", ADRENO_IB_CS_SAMPLER_UNITS_MAX);
+    }
+#endif
     setProperty(ADRENO_IB_REGISTRY_PROPERTY, (unsigned long long)ADRENO_GUEST_IB_ABI, 32);
     setProperty("AdrenoIBCopyABI", (unsigned long long)1, 32);
     ALOG("IB probe completed: package 0x%llx, marker 0x%llx, ticks %llu, wptr %llu", va, reply.marker,
