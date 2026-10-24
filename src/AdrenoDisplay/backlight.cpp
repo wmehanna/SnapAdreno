@@ -122,7 +122,7 @@ AdrenoBacklight *AdrenoBacklight::create(IOService *display)
     }
     b->registerService();
     uint64_t now = edp_bl_level_to_nits(b->fLevel, b->fMaxNits, b->fMax);
-    IOLog("AdrenoBacklight: published (backlight-control): %llu.%03llu..%u nits, level = "
+    IOLog("AdrenoBacklight: published (backlight-control, force-brightness-control): %llu.%03llu..%u nits, level = "
           "nits * %u / %u in levels %u..%u, panel level %u (%llu.%03llu nits)%s\n", b->fMinQ16 >> 16,
           milli(b->fMinQ16 & 0xffff), b->fMaxNits, b->fMax, b->fMaxNits, b->fFloor, b->fMax, b->fLevel, now >> 16,
           milli(now & 0xffff), state == EDP_BL_STATE_MODE ? "; the first change switches the panel to DPCD mode" : "");
@@ -153,6 +153,8 @@ bool AdrenoBacklight::configure(uint64_t x1, uint64_t x2, uint64_t x3)
     }
     // Stays below the top level's luminance: fFloor < fMax (checked above) and fMinNits < fMaxNits.
     fMinQ16 = edp_bl_min_nits_q16(fMinNits, fMaxNits, fFloor, fMax);
+    fShownLevel = fLevel;
+    fShownReady = fState == EDP_BL_STATE_READY;
     fLock = IOLockAlloc();
     fWorkLoop = IOWorkLoop::workLoop();
     if (!fLock || !fWorkLoop)
@@ -166,11 +168,15 @@ bool AdrenoBacklight::start(IOService *provider)
 {
     if (!super::start(provider))
         return false;
-    // The keys CoreBrightness and BrightnessControl read from a backlight service (AdrenoBacklight.h). The 16.16
-    // luminance products are the J700 backlight node's property names; their values are this panel's nominal range,
-    // its mid point CoreBrightness's usual 140 nits (INFERRED).
+    // What BrightnessControl reads from a backlight service (AdrenoBacklight.h, steps 2 and 3). The 16.16 luminance
+    // products are the J700 backlight node's property names; their values are this panel's nominal range, its mid
+    // point CoreBrightness's usual 140 nits (INFERRED). force-brightness-control is read as OSData, first byte only,
+    // the way the device tree would carry it: without it BCAppleBacklightBrtControl never writes brightness-nits here.
+    static const uint8_t kForceBrightnessControl[4] = {1, 0, 0, 0};
     uint64_t mid = 140ull << 16, top = (uint64_t)fMaxNits << 16;
     mid = mid < fMinQ16 ? fMinQ16 : mid > top ? top : mid;
+    if (!setProperty("force-brightness-control", (void *)kForceBrightnessControl, sizeof(kForceBrightnessControl)))
+        return false;
     setProperty("backlight-control", kOSBooleanTrue);
     setProperty("LminProduct", (unsigned long long)fMinQ16, 32);
     setProperty("LmidProduct", (unsigned long long)mid, 32);
@@ -234,6 +240,13 @@ IOReturn AdrenoBacklight::requestNits(uint64_t nits_q16, Source source)
         return kIOReturnNotReady;
     }
     fRequests[source]++;
+    // WindowServer may repeat a value with every swap; a level the panel already shows needs no monitor call. Only
+    // in DPCD mode: before the mode switch the panel's 0x722 says nothing about what it shows.
+    if (!fPending && !fArmed && fShownReady && level == fShownLevel) {
+        fUnchanged++;
+        IOLockUnlock(fLock);
+        return kIOReturnSuccess;
+    }
     if (fPending)
         fCoalesced++;
     fPending = true;
@@ -281,6 +294,8 @@ void AdrenoBacklight::apply(IOTimerEventSource *)
                          e == EDP_BL_E_ORIGIN || e == EDP_BL_E_OP);
     IOLockLock(fLock);
     fLastApply = mach_absolute_time();
+    fShownLevel = fLevel;
+    fShownReady = fState == EDP_BL_STATE_READY;
     if (e) {
         fErrors++;
         fLastError = e;
@@ -334,7 +349,7 @@ void AdrenoBacklight::publish()
         setProperty("IODisplayParameters", params);
     IOLockLock(fLock);
     uint64_t requests[kSources] = {fRequests[0], fRequests[1], fRequests[2]};
-    uint64_t applied = fApplied, clamped = fClamped, errors = fErrors, coalesced = fCoalesced;
+    uint64_t applied = fApplied, clamped = fClamped, errors = fErrors, coalesced = fCoalesced, unchanged = fUnchanged;
     int64_t lastError = fLastError;
     bool stopped = fStopped;
     IOLockUnlock(fLock);
@@ -347,7 +362,8 @@ void AdrenoBacklight::publish()
         putNum(diag, "RequestsBrightness", requests[kSourceSlider], 64) &&
         putNum(diag, "RequestsIOMFB", requests[kSourceIOMFB], 64) && putNum(diag, "Applied", applied, 64) &&
         putNum(diag, "Clamped", clamped, 64) && putNum(diag, "Errors", errors, 64) &&
-        putNum(diag, "Coalesced", coalesced, 64) && putNum(diag, "LastError", (uint64_t)lastError, 64) &&
+        putNum(diag, "Coalesced", coalesced, 64) && putNum(diag, "Unchanged", unchanged, 64) &&
+        putNum(diag, "LastError", (uint64_t)lastError, 64) &&
         putNum(diag, "Stopped", stopped))
         setProperty("AdrenoBacklight", diag);
     OSSafeReleaseNULL(params);

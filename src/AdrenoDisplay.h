@@ -138,9 +138,9 @@
 #define ADRENO_DISPLAY_TRACE_MODES 0
 #endif
 // --edp-backlight (agents/brightness): -DADRENO_BACKLIGHT=1 publishes AdrenoBacklight (AdrenoBacklight.h), the panel's
-// backlight service for CoreBrightness, which sets the panel's DPCD brightness through the monitor's
-// ADRENO_GUEST_BACKLIGHT (-DSNAP_EDP_BACKLIGHT=1). Needs boot-arg adreno_backlight=1 at run time too. Off by default;
-// without it this source compiles as before.
+// backlight service: WindowServer's BrightnessControl writes CoreBrightness's nits to it, and it sets the panel's DPCD
+// brightness through the monitor's ADRENO_GUEST_BACKLIGHT (-DSNAP_EDP_BACKLIGHT=1). Needs boot-arg adreno_backlight=1
+// at run time too. Off by default; without it this source compiles as before.
 #ifndef ADRENO_BACKLIGHT
 #define ADRENO_BACKLIGHT 0
 #endif
