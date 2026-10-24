@@ -79,6 +79,18 @@ extern "C" void AdrenoPresentSyncCounters(uint64_t *marks, uint64_t *overflows, 
 #ifndef ADRENO_GPU_RECOVER
 #define ADRENO_GPU_RECOVER 0
 #endif
+// agents/resident-evict (REPORT.md; -DADRENO_RESIDENT_REPIN=1 in every unit): a backing descriptor shorter than its map by
+// less than a page (IOGPU's page-rounded memory length; compat/adreno-resource-tail.h) is pinned and mapped in whole
+// pages instead of refused on every commit; a commit that is refused cleanly (nothing pinned or mapped) no longer fails
+// the other maps of its memory: it is reported committed, the map stays unadmitted, its own submissions retry the pin
+// under their native preparation and are refused cleanly, reported once per map (pid, IOSurface, lengths); boot-arg
+// adreno_resident_mib sets the residency budget. Off by default; without it this source compiles as before.
+#ifndef ADRENO_RESIDENT_REPIN
+#define ADRENO_RESIDENT_REPIN 0
+#endif
+#if ADRENO_RESIDENT_REPIN
+extern "C" uint64_t AdrenoGPUMapBudget(void);   // AdrenoMemoryMap.cpp: the residency budget in effect, bytes
+#endif
 #if ADRENO_PIPELINE
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -145,6 +157,10 @@ public:
 #endif
     int resolveFill(uint64_t offset, uint64_t bytes, uint64_t *address);
     int resolveRange(uint64_t offset, uint64_t bytes, uint64_t *address);   // IB relocations (design 3.2)
+#if ADRENO_RESIDENT_REPIN
+    // agents/resident-evict: a submission of `resource` (an IOGPUResource) found this map unadmitted; one line per map.
+    void reportRefused(const void *resource);
+#endif
     virtual void free() APPLE_KEXT_OVERRIDE;
     virtual bool allocGPUVirtualAddress() APPLE_KEXT_OVERRIDE;
     virtual bool reserveGPUVirtualAddress(unsigned long long address, unsigned long long length) APPLE_KEXT_OVERRIDE;
@@ -180,6 +196,13 @@ private:
     uint64_t fLastNativeStatus;
 #if ADRENO_CACHE_SPARSE
     struct adreno_cache_mark fCacheMark;
+#endif
+#if ADRENO_RESIDENT_REPIN
+    bool cleanlyRefused() const;   // caller holds the recursive lock
+    uint64_t fBackingBytes;        // fBacking's length when shorter than the map (the tail rule), else 0
+    int32_t fRefusal;              // the last commit error reported committed (a clean refusal), 0 none
+    uint32_t fRefusalStatus;       // its native status
+    uint32_t fRefusalReported;     // reportRefused has logged this map
 #endif
 };
 

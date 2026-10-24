@@ -11,6 +11,28 @@
 
 #define MLOG(fmt, ...) IOLog("AdrenoX2 resource: " fmt "\n", ##__VA_ARGS__)
 
+#if ADRENO_RESIDENT_REPIN
+#include <pexpert/pexpert.h>
+#include "../../../../compat/adreno-resource-tail.h"
+// agents/resident-evict (REPORT.md). The budget's boot-arg ceiling; counters and log rate limits, all in bss (R13).
+static constexpr uint32_t kAdrenoResidentMaxMiB = 4096;
+enum { kRepinTail, kRepinRefused, kRepinRetried, kRepinRecovered, kRepinReports, kRepinCounters };
+static uint64_t gRepin[kRepinCounters];
+static uint32_t gRepinMapFailedLogged, gRepinPrepareLogged;
+static void repinCount(unsigned which) { __atomic_fetch_add(&gRepin[which], 1, __ATOMIC_RELAXED); }
+// The first 16 of a kind, then every 1024th: what was one line per failed frame in b12v17 (13,383 lines).
+static uint32_t repinLogDue(uint32_t *logged)
+{
+    uint32_t n = __atomic_add_fetch(logged, 1, __ATOMIC_RELAXED);
+    return n <= 16 || !(n & 1023) ? n : 0;
+}
+// IOGPUFamily 26A428 exports: IOGPUTask::getProcessIDAndName (0x464b0: proc_pid and proc_name of the task at +0x28),
+// IOGPUResource::getIOSurface, IOSurface::getSurfaceID (both already imported by --present-sync).
+extern "C" int AdrenoRepinTaskPidName(const void *, char *, int) __asm__("__ZNK9IOGPUTask19getProcessIDAndNameEPci");
+extern "C" void *AdrenoRepinResourceIOSurface(const void *) __asm__("__ZNK13IOGPUResource12getIOSurfaceEv");
+extern "C" uint32_t AdrenoRepinIOSurfaceID(const void *) __asm__("__ZNK9IOSurface12getSurfaceIDEv");
+#endif
+
 // One budget for every map's resident translations (atomic in compat/adreno-resource.c).
 #if ADRENO_RESIDENT_BUDGET_MIB
 // Residency on (pacing work 2026-10-21, R13): zero here, so the object keeps no initialized data ahead of
@@ -18,10 +40,27 @@
 static struct adreno_residency gResidency;
 extern "C" void AdrenoGPUMapStart(void)
 {
+#if ADRENO_RESIDENT_REPIN
+    // Boot-arg adreno_resident_mib (0 .. kAdrenoResidentMaxMiB; 0 retains nothing) replaces the build's budget.
+    uint64_t budget = kAdrenoResidentBudget;
+    uint32_t mib = 0;
+    const bool set = PE_parse_boot_argn("adreno_resident_mib", &mib, sizeof(mib));
+    if (set) budget = (uint64_t)(mib < kAdrenoResidentMaxMiB ? mib : kAdrenoResidentMaxMiB) << 20;
+    __atomic_store_n(&gResidency.budget, budget, __ATOMIC_RELEASE);
+    MLOG("resident budget %llu MiB (%s), short backings mapped in whole pages", (unsigned long long)(budget >> 20),
+         set ? "boot-arg adreno_resident_mib" : "build");
+#else
     __atomic_store_n(&gResidency.budget, kAdrenoResidentBudget, __ATOMIC_RELEASE);
+#endif
 }
 #else
 static struct adreno_residency gResidency = {kAdrenoResidentBudget, 0, 0, 0, 0, 0};
+#endif
+#if ADRENO_RESIDENT_REPIN
+extern "C" uint64_t AdrenoGPUMapBudget(void)
+{
+    return __atomic_load_n(&gResidency.budget, __ATOMIC_ACQUIRE);
+}
 #endif
 static uint32_t gResidencyFullLogged;
 #if ADRENO_PERF_GPU
@@ -186,17 +225,45 @@ bool AdrenoMemoryMap::prepareForSubmission()
     IOReturn result=AdrenoNativePrepareMemory(memory);
 #endif
     if (result!=kIOReturnSuccess) {
+#if ADRENO_RESIDENT_REPIN
+        if (const uint32_t n=repinLogDue(&gRepinPrepareLogged))
+            MLOG("submission prepare failed 0x%x (%u)",result,n);
+#else
         MLOG("submission prepare failed 0x%x",result);
+#endif
         return false; // native slow failure already removed its speculative ref
     }
     IORecursiveLockLock(fLock);
+#if ADRENO_RESIDENT_REPIN
+    // The re-pin: a map whose commit was refused cleanly and reported committed (commitIntoGPUPageTable) is natively
+    // wired with the rest of its memory. Under the native preparation held here the memory stays wired and its
+    // descriptor current, so pin and map it now, at the address it keeps reserved; refused again, it stays unadmitted.
+    if (fRefusal && cleanlyRefused() && nativeAllocated() &&
+        fResource.address==IOGPUMemoryMap::getGPUVirtualAddress()) {
+        auto ops=operations();
+        const int e=adreno_resource_rewire(&fResource,&ops,&gResidency,1,ADRENO_COMMIT_RUNS);
+        repinCount(kRepinRetried);
+        if (!e) {
+            fRefusal=0;
+            repinCount(kRepinRecovered);
+        } else if (cleanlyRefused()) {
+            fRefusal=e;
+            fRefusalStatus=static_cast<uint32_t>(fLastNativeStatus);
+        }
+    }
+#endif
     bool ok=fResource.flags==(ADRENO_RESOURCE_RESERVED|ADRENO_RESOURCE_PINNED) &&
         fResource.length && fResource.mapped_length==fResource.length && fBacking &&
         memory->get_iomd_ptr()==fBacking && nativeAllocated() &&
         fResource.address==IOGPUMemoryMap::getGPUVirtualAddress();
     IORecursiveLockUnlock(fLock);
     if (!ok) {
+#if ADRENO_RESIDENT_REPIN
+        if (const uint32_t n=repinLogDue(&gRepinPrepareLogged))
+            MLOG("native preparation did not produce a complete admitted mapping (%u)",n);
+#else
         MLOG("native preparation did not produce a complete admitted mapping");
+#endif
         AdrenoNativeCompleteMemory(memory);
     }
     return ok;
@@ -243,7 +310,14 @@ int AdrenoMemoryMap::cacheSubmission(unsigned direction)
     // The GPU cannot write read-only backing (its DART and SMMU leaves are no-write), so there is
     // nothing to invalidate after it, and the monitor refuses FROM_DEVICE on such a leaf.
     if (backing && direction==ADRENO_CACHE_FROM_DEVICE && fBackingDirection==kIODirectionOut) direction=0;
+#if ADRENO_RESIDENT_REPIN
+    // A short backing: only its own lines, its partial last line cleaned rather than invalidated (adreno-resource-tail.h).
+    int result=!backing ? ADRENO_RESOURCE_E_STATE : fBackingBytes ?
+        adreno_tail_cache(&fResource,fBackingBytes,direction,0,fResource.logical_length,maintainCache,this) :
+        adreno_resource_cache(&fResource,direction,maintainCache,this);
+#else
     int result=backing ? adreno_resource_cache(&fResource,direction,maintainCache,this) : ADRENO_RESOURCE_E_STATE;
+#endif
     IORecursiveLockUnlock(fLock);
     return result;
 }
@@ -258,8 +332,14 @@ int AdrenoMemoryMap::cacheRange(unsigned direction, uint64_t offset, uint64_t by
     bool backing=memory && fBacking && nativeAllocated() && memory->get_iomd_ptr()==fBacking &&
         fResource.address==IOGPUMemoryMap::getGPUVirtualAddress();
     if (backing && direction==ADRENO_CACHE_FROM_DEVICE && fBackingDirection==kIODirectionOut) direction=0;
+#if ADRENO_RESIDENT_REPIN
+    int result=!backing ? ADRENO_RESOURCE_E_STATE : fBackingBytes ?
+        adreno_tail_cache(&fResource,fBackingBytes,direction,offset,bytes,maintainCache,this) :
+        adreno_resource_cache_range(&fResource,direction,offset,bytes,maintainCache,this);
+#else
     int result=backing ? adreno_resource_cache_range(&fResource,direction,offset,bytes,maintainCache,this) :
                          ADRENO_RESOURCE_E_STATE;
+#endif
     IORecursiveLockUnlock(fLock);
     return result;
 }
@@ -361,7 +441,15 @@ int AdrenoMemoryMap::pinBacking(void *ctx)
     auto *map = static_cast<AdrenoMemoryMap *>(ctx);
     IOGPUMemory *memory = map->nativeMemory();
     IOMemoryDescriptor *backing = memory ? memory->get_iomd_ptr() : nullptr;
+#if ADRENO_RESIDENT_REPIN
+    // IOGPU's map length is the descriptor's page-rounded DMA length (adreno-resource-tail.h): a descriptor that ends
+    // inside the map's last page is admitted and mapped in whole pages; any larger shortfall is refused as before.
+    const uint64_t bytes = backing ? backing->getLength() : 0;
+    const bool tail = bytes < map->fResource.logical_length && adreno_tail_admit(bytes, map->fResource.logical_length);
+    if (map->fBacking || !backing || (bytes < map->fResource.logical_length && !tail)) {
+#else
     if (map->fBacking || !backing || backing->getLength() < map->fResource.logical_length) {
+#endif
         map->fLastNativeStatus = static_cast<uint32_t>(kIOReturnBadArgument);
         return kIOReturnBadArgument;
     }
@@ -380,6 +468,10 @@ int AdrenoMemoryMap::pinBacking(void *ctx)
     if (result != kIOReturnSuccess) { backing->release(); return result; }
     map->fBacking = backing;
     map->fBackingDirection = direction;
+#if ADRENO_RESIDENT_REPIN
+    map->fBackingBytes = tail ? bytes : 0;
+    if (tail) repinCount(kRepinTail);
+#endif
 #if ADRENO_CACHE_SPARSE
     map->clearCacheMark();   // new pages: nothing about them is known to be clean (FAILURE-MODES.md C1d, C6)
 #endif
@@ -392,6 +484,9 @@ int AdrenoMemoryMap::unpinBacking(void *ctx)
     map->fLastNativeStatus = static_cast<uint32_t>(result);
     if (result != kIOReturnSuccess) return result; // retain on uncertain completion
     OSSafeReleaseNULL(map->fBacking);
+#if ADRENO_RESIDENT_REPIN
+    map->fBackingBytes = 0;
+#endif
 #if ADRENO_CACHE_SPARSE
     map->clearCacheMark();
 #endif
@@ -402,7 +497,12 @@ uint64_t AdrenoMemoryMap::physicalPage(void *ctx, uint64_t offset, uint64_t *len
     auto *map = static_cast<AdrenoMemoryMap *>(ctx);
     IOByteCount span = 0;
     uint64_t pa = map->fBacking->getPhysicalSegment(offset, &span, kIOMemoryMapperNone);
+#if ADRENO_RESIDENT_REPIN
+    // A short backing's last run goes on to the end of its page, which the wire holds whole.
+    *length = map->fBackingBytes ? adreno_tail_span(offset, span, map->fBackingBytes) : span;
+#else
     *length = span;
+#endif
     return pa;
 }
 int AdrenoMemoryMap::insertPage(void *ctx, uint64_t address, uint64_t offset, uint64_t pa, uint64_t size)
@@ -590,10 +690,70 @@ bool AdrenoMemoryMap::commitIntoGPUPageTable()
     // Resident with the same descriptor: nothing to map. Resident with another descriptor: the
     // stale translations are cleared and unpinned before the new descriptor is pinned.
     int error = adreno_resource_rewire(&fResource, &ops, &gResidency, same, ADRENO_COMMIT_RUNS);
+#if ADRENO_RESIDENT_REPIN
+    // A clean refusal (nothing pinned, nothing mapped, nothing frozen) is reported committed: IOGPUMemory::commit_mappings
+    // (0x1323c) would otherwise roll back every other map of this memory and fail the native preparation of every task
+    // that uses it (b12v17: one refused map failed a command buffer every frame). This map stays unadmitted; only its
+    // own submissions retry the pin (prepareForSubmission) and are refused cleanly. Frozen failures return false as before.
+    bool refused = false;
+    if (!error) {
+        fRefusal = 0;
+    } else if (cleanlyRefused()) {
+        refused = true;
+        fRefusal = error;
+        fRefusalStatus = static_cast<uint32_t>(fLastNativeStatus);
+        repinCount(kRepinRefused);
+    }
+    if (error) {
+        if (const uint32_t n = repinLogDue(&gRepinMapFailedLogged))
+            MLOG("map failed %d native=0x%llx address=0x%llx length=0x%llx%s (%u)", error, fLastNativeStatus,
+                 fResource.address, fResource.logical_length, refused ? ", unadmitted" : "", n);
+    }
+    IORecursiveLockUnlock(fLock);
+    return error == 0 || refused;
+#else
     if (error) MLOG("map failed %d native=0x%llx address=0x%llx", error, fLastNativeStatus, fResource.address);
     IORecursiveLockUnlock(fLock);
     return error == 0;
+#endif
 }
+#if ADRENO_RESIDENT_REPIN
+bool AdrenoMemoryMap::cleanlyRefused() const
+{
+    // The state a failed commit leaves after its own unwind succeeded: reserved and bound, no pin, no leaf.
+    return fResource.flags == ADRENO_RESOURCE_RESERVED && fResource.length && !fResource.mapped_length && !fBacking;
+}
+void AdrenoMemoryMap::reportRefused(const void *resource)
+{
+    if (!fLock) return;
+    IORecursiveLockLock(fLock);
+    const bool first = !fRefusalReported;
+    fRefusalReported = 1;
+    IOGPUMemory *memory = nativeMemory();
+    IOMemoryDescriptor *backing = memory ? memory->get_iomd_ptr() : nullptr;
+    const uint64_t descriptor = backing ? backing->getLength() : 0;
+    const uint64_t address = fResource.address, length = fResource.logical_length;
+    const unsigned flags = fResource.flags;
+    const int32_t refusal = fRefusal;
+    const uint32_t status = fRefusalStatus;
+    IORecursiveLockUnlock(fLock);
+    if (!first) return;
+    const uint64_t n = __atomic_add_fetch(&gRepin[kRepinReports], 1, __ATOMIC_RELAXED);
+    if (n > 32 && (n & 255)) return;
+    // The map's IOGPUTask (IOGPUMemoryMap::init 0x54ac0 stores it, retained, at +0x20); the caller holds the map.
+    const void *task = *reinterpret_cast<const void *const *>(reinterpret_cast<const uint8_t *>(this) + 0x20);
+    char name[33] = {};
+    const int pid = task ? AdrenoRepinTaskPidName(task, name, sizeof(name)) : -1;
+    const void *surface = resource ? AdrenoRepinResourceIOSurface(resource) : nullptr;
+    const uint32_t surfaceID = surface ? AdrenoRepinIOSurfaceID(surface) : 0;
+    MLOG("unadmitted map refused a submission: pid %d (%s) IOSurface %u address=0x%llx length=0x%llx descriptor=0x%llx "
+         "flags=0x%x refusal %d native=0x%x; maps tail %llu refused %llu retried %llu recovered %llu (%llu)", pid, name,
+         surfaceID, address, length, descriptor, flags, refusal, status,
+         __atomic_load_n(&gRepin[kRepinTail], __ATOMIC_RELAXED), __atomic_load_n(&gRepin[kRepinRefused], __ATOMIC_RELAXED),
+         __atomic_load_n(&gRepin[kRepinRetried], __ATOMIC_RELAXED),
+         __atomic_load_n(&gRepin[kRepinRecovered], __ATOMIC_RELAXED), n);
+}
+#endif
 void AdrenoMemoryMap::releaseFromGPUPageTable()
 {
     // Native unwire after the GPU retired every preparation. Within the budget the translations

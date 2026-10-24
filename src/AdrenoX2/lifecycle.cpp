@@ -178,8 +178,13 @@ bool AdrenoAcceleratorX2::start(IOService *provider)
     { extern bool AdrenoDisplayAttach(IOService *); AdrenoDisplayAttach(this); }   // Stage 8 panel child (AdrenoDisplay.cpp); never fatal
     ALOG("started: %u stamps, queue args 0x%x, synchronous GPU fence transport, IB %s", ADRENO_NUM_STAMPS,
          ADRENO_QUEUE_ARGS_SIZE, fIB && (fIB->state & ADRENO_IB_STATE_READY) ? "ready" : "off");
+#if ADRENO_RESIDENT_REPIN
+    ALOG("GPU mappings resident across unwire: budget %llu MiB, contiguous-run inserts",
+         (unsigned long long)(AdrenoGPUMapBudget() >> 20));   // agents/resident-evict: boot-arg adreno_resident_mib
+#else
     ALOG("GPU mappings resident across unwire: budget %llu MiB, contiguous-run inserts",
          (unsigned long long)(kAdrenoResidentBudget >> 20));
+#endif
     return true;
 }
 

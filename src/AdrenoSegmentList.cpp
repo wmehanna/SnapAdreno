@@ -35,7 +35,15 @@ int AdrenoSegmentList::prepareResource(void *, void *resource, void **token)
     auto *map=OSDynamicCast(AdrenoMemoryMap,native);
     if (!map) return -1;
     map->retain();
+#if ADRENO_RESIDENT_REPIN
+    if (!map->prepareForSubmission()) {
+        map->reportRefused(resource);   // agents/resident-evict: once per map, with pid, IOSurface and lengths
+        map->release();
+        return -1;
+    }
+#else
     if (!map->prepareForSubmission()) { map->release(); return -1; }
+#endif
     *token=map;
     return 0;
 }
@@ -186,7 +194,15 @@ bool AdrenoSegmentList::initWithSharedResourceList(IOGPUDevice *device,
     // A base acquisition succeeded; balance even on every later failure.
     AdrenoShmemReleaseData(shmem);
     if (snapshot) IOFree(snapshot,snapshotBytes);
+#if ADRENO_RESIDENT_REPIN
+    if (result) {   // the first 16, then every 1024th, counted (b12v17: one line per failed frame)
+        static uint32_t logged;
+        const uint32_t n=__atomic_add_fetch(&logged,1,__ATOMIC_RELAXED);
+        if (n<=16 || !(n&1023)) IOLog("AdrenoX2 resource list: preparation failed %d (%u)\n",result,n);
+    }
+#else
     if (result) IOLog("AdrenoX2 resource list: preparation failed %d\n",result);
+#endif
     return result==0; // caller releases a failed object and its partial state
 }
 
