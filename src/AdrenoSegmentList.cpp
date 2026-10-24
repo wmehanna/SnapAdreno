@@ -44,6 +44,9 @@ int AdrenoSegmentList::prepareResource(void *, void *resource, void **token)
 #else
     if (!map->prepareForSubmission()) { map->release(); return -1; }
 #endif
+#if ADRENO_COHERENT_SKIP_MAINT
+    map->noteCoherentClass(resource);   // IO-coherent leaves: the backing's declared class, before any maintenance
+#endif
     *token=map;
     return 0;
 }
@@ -93,6 +96,9 @@ static void noteSparse() {}
 // (its one write is the kext's stamp page), so the list is validated and nothing is maintained (C9, C13).
 int AdrenoSegmentList::submit(int (*work)(void *), void *context)
 {
+#if ADRENO_COHERENT_SKIP_MAINT
+    AdrenoMemoryMap::coherentRefresh();   // IO-coherent leaves: every kernel command, under fSubmitLock
+#endif
     const struct adreno_resource_list_ops ops={fDevice,retainResource,releaseResource,
         prepareResource,completeResource,syncResource};
 #if ADRENO_CACHE_SPARSE
@@ -117,6 +123,9 @@ int AdrenoSegmentList::resolveFill(void *, void *resource, void *token,
 int AdrenoSegmentList::fill(const struct adreno_fill32_request *request,
                            int (*transfer)(void *, uint64_t, uint64_t, uint32_t), void *context)
 {
+#if ADRENO_COHERENT_SKIP_MAINT
+    AdrenoMemoryMap::coherentRefresh();
+#endif
     const struct adreno_resource_list_ops ops={fDevice,retainResource,releaseResource,
         prepareResource,completeResource,syncResource};
 #if ADRENO_CACHE_SPARSE
@@ -142,6 +151,9 @@ int AdrenoSegmentList::resolveRange(void *, void *resource, void *token,
 int AdrenoSegmentList::ib(struct adreno_ib_work *work, const void *command, uint64_t bytes,
                          int (*ring)(void *, uint64_t, uint64_t, uint64_t, struct adreno_ib_reply *), void *context)
 {
+#if ADRENO_COHERENT_SKIP_MAINT
+    AdrenoMemoryMap::coherentRefresh();
+#endif
     const struct adreno_resource_list_ops ops={fDevice,retainResource,releaseResource,
         prepareResource,completeResource,syncResource};
 #if ADRENO_CACHE_SPARSE

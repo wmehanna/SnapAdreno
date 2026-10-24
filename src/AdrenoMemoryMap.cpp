@@ -63,6 +63,72 @@ extern "C" uint64_t AdrenoGPUMapBudget(void)
 }
 #endif
 static uint32_t gResidencyFullLogged;
+#if ADRENO_COHERENT_SKIP_MAINT
+// IO-coherent CB0 leaves (compat/adreno-coherent-skip.h). The monitor's answer and epoch, written by coherentRefresh under
+// fSubmitLock and read by the maintenance below, which every submission path runs under it too. Zero-initialized
+// (__bss): no initialized data ahead of kmod_info.
+static struct adreno_coherent_gate gCoherent;
+static uint32_t gCoherentWanted;              // 0 not yet decided, 1 boot-arg adreno_coherent=1, 2 off for this boot
+static uint32_t gCoherentForce;               // boot-arg adreno_coherent_force=1: accept a debug monitor's forced ON
+enum { kCoherentRefreshes, kCoherentEpochs, kCoherentSkips, kCoherentSkipBytes, kCoherentCalls, kCoherentMaintained,
+       kCoherentVerdicts, kCoherentPlain, kCoherentCounters };
+static uint64_t gCoherentCount[kCoherentCounters];
+static void coherentCount(unsigned which, uint64_t n) { __atomic_fetch_add(&gCoherentCount[which], n, __ATOMIC_RELAXED); }
+extern "C" uint32_t AdrenoCoherentSurfaceCacheMode(const void *) __asm__("__ZNK9IOSurface12getCacheModeEv");
+extern "C" void *AdrenoCoherentResourceIOSurface(const void *) __asm__("__ZNK13IOGPUResource12getIOSurfaceEv");
+void AdrenoMemoryMap::coherentRefresh()
+{
+    if (!gCoherentWanted) {
+        uint32_t arg = 0;
+        gCoherentWanted = PE_parse_boot_argn("adreno_coherent", &arg, sizeof(arg)) && arg ? 1 : 2;
+        arg = 0;
+        gCoherentForce = PE_parse_boot_argn("adreno_coherent_force", &arg, sizeof(arg)) && arg;
+        if (gCoherentWanted == 2) MLOG("coherent: off (boot-arg adreno_coherent not set): every map keeps its maintenance");
+    }
+    if (gCoherentWanted != 1) return;
+    register uint64_t x0 __asm__("x0") = ADRENO_GUEST_COHERENT;
+    register uint64_t x1 __asm__("x1") = ADRENO_COHERENT_QUERY;
+    register uint64_t x2 __asm__("x2") = 0;
+    register uint64_t x3 __asm__("x3") = 0;
+    __asm__ volatile("hvc %4" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : "i"(ADRENO_GUEST_HVC) : "memory", "cc");
+    const bool first = !gCoherent.asked;
+    const uint64_t before = gCoherent.epoch;
+    adreno_coherent_gate_reply(&gCoherent, x0, x1, x2, gCoherentForce);
+    if (first) {   // loud either way: the run's evidence of what the monitor's self-test decided
+        MLOG("coherent: monitor status %lld state %llu detail %#llx passed %llu epoch %llu: %s", (long long)x0,
+             (x1 >> 8) & 0xff, (x1 >> 16) & 0xffff, x3, x2,
+             gCoherent.on ? "write-back maps skip maintenance once verified" : "every map keeps its maintenance");
+        if (gCoherent.forced)   // a debug monitor: nothing proved this machine coherent
+            MLOG("coherent: *** FORCED ON WITHOUT THE SELF-TEST (debug monitor, SNAP_ADRENO_COHERENT_FORCE): %s ***",
+                 gCoherent.on ? "write-back maps SKIP maintenance UNPROVEN (adreno_coherent_force=1), for an A/B "
+                                "rendering check only"
+                              : "refused, boot-arg adreno_coherent_force not set: every map keeps its maintenance");
+    }
+    if (!gCoherent.on) { gCoherentWanted = 2; return; }   // the answer never turns ON later: stop asking
+    coherentCount(kCoherentRefreshes, 1);
+    if (gCoherent.epoch != before) coherentCount(kCoherentEpochs, 1);
+#if ADRENO_PERF_GPU
+    if (!(__atomic_load_n(&gCoherentCount[kCoherentRefreshes], __ATOMIC_RELAXED) & 1023)) {
+        uint64_t v[kCoherentCounters];
+        for (unsigned i = 0; i < kCoherentCounters; i++) v[i] = __atomic_load_n(&gCoherentCount[i], __ATOMIC_RELAXED);
+        MLOG("coherent: commands=%llu epochs=%llu skips=%llu/%lluMiB calls=%llu maintained=%lluMiB verdicts=%llu "
+             "plain=%llu", v[kCoherentRefreshes], v[kCoherentEpochs], v[kCoherentSkips], v[kCoherentSkipBytes] >> 20,
+             v[kCoherentCalls], v[kCoherentMaintained] >> 20, v[kCoherentVerdicts], v[kCoherentPlain]);
+    }
+#endif
+}
+void AdrenoMemoryMap::noteCoherentClass(const void *resource)
+{
+    // An IOSurface keeps today's maintenance unless its own declared cache mode is write-back. The declared mode
+    // never changes, so this stays conservative after AdrenoDisplay converts a framebuffer (it still reads
+    // write-combine); every other frame's live attribute is the monitor's to check (the coherent call).
+    const void *surface = resource ? AdrenoCoherentResourceIOSurface(resource) : nullptr;
+    const uint32_t mode = surface ? AdrenoCoherentSurfaceCacheMode(surface) : kIOMapDefaultCache;
+    IORecursiveLockLock(fLock);
+    fCoherentDeclaredWB = mode == kIOMapDefaultCache || mode == kIOMapCopybackCache || mode == kIOMapCopybackInnerCache;
+    IORecursiveLockUnlock(fLock);
+}
+#endif
 #if ADRENO_PERF_GPU
 // The perf gpu line (AdrenoDisplayPacing.h, P1-P7): totals that only grow; AdrenoDisplay takes window deltas.
 // Writers are IOGPU's submission and scheduler threads on any CPU, so every update is a relaxed atomic add.
@@ -285,14 +351,29 @@ int AdrenoMemoryMap::maintainCache(void *context, uint64_t address, uint64_t byt
     register uint64_t x1 __asm__("x1")=address;
     register uint64_t x2 __asm__("x2")=bytes;
     register uint64_t x3 __asm__("x3")=direction;
+#if ADRENO_COHERENT_SKIP_MAINT
+    const unsigned how=map->fCoherentHow;
+    x3=adreno_coherent_direction(how,direction);
+#endif
     __asm__ volatile("dsb ish\n\thvc %4" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
                      : "i"(ADRENO_GUEST_HVC) : "memory", "cc");
 #if ADRENO_PERF_GPU
     workAdd(kWorkCacheCalls,1);
+#if ADRENO_COHERENT_SKIP_MAINT
+    workAdd(kWorkCacheBytes,how==ADRENO_COHERENT_CALL && !x0 ? x2 : bytes);   // what the monitor really maintained
+#else
     workAdd(kWorkCacheBytes,bytes);
+#endif
     workAdd(kWorkCacheTicks,mach_absolute_time()-cacheStart);
 #endif
     map->fLastNativeStatus=x0;
+#if ADRENO_COHERENT_SKIP_MAINT
+    if (adreno_coherent_reply_ok(how,bytes,x0,x1,x2)) {
+        if (how==ADRENO_COHERENT_CALL) { map->fCoherentMaintained+=x2; coherentCount(kCoherentCalls,1);
+                                         coherentCount(kCoherentMaintained,x2); }
+        return 0;
+    }
+#endif
     if (x0 || x1!=bytes || x2) {
         MLOG("cache direction %u failed status=0x%llx completed=0x%llx reserved=0x%llx",
              direction,x0,x1,x2);
@@ -310,6 +391,21 @@ int AdrenoMemoryMap::cacheSubmission(unsigned direction)
     // The GPU cannot write read-only backing (its DART and SMMU leaves are no-write), so there is
     // nothing to invalidate after it, and the monitor refuses FROM_DEVICE on such a leaf.
     if (backing && direction==ADRENO_CACHE_FROM_DEVICE && fBackingDirection==kIODirectionOut) direction=0;
+#if ADRENO_COHERENT_SKIP_MAINT
+    // IO-coherent leaves: a map verified write-back at this epoch is validated only, like read-only backing above; an
+    // unverified one is maintained with ADRENO_CACHE_COHERENT, and a whole pass that left nothing to maintain is its
+    // verdict (compat/adreno-coherent-skip.h).
+    fCoherentHow=backing && direction ? adreno_coherent_choose(&gCoherent,fCoherentDeclaredWB,fCoherentVerdict) :
+                                        ADRENO_COHERENT_PLAIN;
+    fCoherentMaintained=0;
+    if (fCoherentHow==ADRENO_COHERENT_SKIP) {
+        coherentCount(kCoherentSkips,1);
+        coherentCount(kCoherentSkipBytes,fResource.logical_length);
+        direction=0;
+    } else if (backing && direction && gCoherent.on && fCoherentHow==ADRENO_COHERENT_PLAIN) {
+        coherentCount(kCoherentPlain,1);
+    }
+#endif
 #if ADRENO_RESIDENT_REPIN
     // A short backing: only its own lines, its partial last line cleaned rather than invalidated (adreno-resource-tail.h).
     int result=!backing ? ADRENO_RESOURCE_E_STATE : fBackingBytes ?
@@ -317,6 +413,13 @@ int AdrenoMemoryMap::cacheSubmission(unsigned direction)
         adreno_resource_cache(&fResource,direction,maintainCache,this);
 #else
     int result=backing ? adreno_resource_cache(&fResource,direction,maintainCache,this) : ADRENO_RESOURCE_E_STATE;
+#endif
+#if ADRENO_COHERENT_SKIP_MAINT
+    if (fCoherentHow==ADRENO_COHERENT_CALL) {
+        fCoherentVerdict=adreno_coherent_verdict(&gCoherent,result,fCoherentMaintained);
+        if (fCoherentVerdict) coherentCount(kCoherentVerdicts,1);
+    }
+    fCoherentHow=ADRENO_COHERENT_PLAIN;
 #endif
     IORecursiveLockUnlock(fLock);
     return result;
@@ -332,6 +435,13 @@ int AdrenoMemoryMap::cacheRange(unsigned direction, uint64_t offset, uint64_t by
     bool backing=memory && fBacking && nativeAllocated() && memory->get_iomd_ptr()==fBacking &&
         fResource.address==IOGPUMemoryMap::getGPUVirtualAddress();
     if (backing && direction==ADRENO_CACHE_FROM_DEVICE && fBackingDirection==kIODirectionOut) direction=0;
+#if ADRENO_COHERENT_SKIP_MAINT
+    // As cacheSubmission, except that a range pass never makes a verdict.
+    fCoherentHow=backing && direction ? adreno_coherent_choose(&gCoherent,fCoherentDeclaredWB,fCoherentVerdict) :
+                                        ADRENO_COHERENT_PLAIN;
+    if (fCoherentHow==ADRENO_COHERENT_SKIP) { coherentCount(kCoherentSkips,1); coherentCount(kCoherentSkipBytes,bytes);
+                                              direction=0; }
+#endif
 #if ADRENO_RESIDENT_REPIN
     int result=!backing ? ADRENO_RESOURCE_E_STATE : fBackingBytes ?
         adreno_tail_cache(&fResource,fBackingBytes,direction,offset,bytes,maintainCache,this) :
@@ -339,6 +449,9 @@ int AdrenoMemoryMap::cacheRange(unsigned direction, uint64_t offset, uint64_t by
 #else
     int result=backing ? adreno_resource_cache_range(&fResource,direction,offset,bytes,maintainCache,this) :
                          ADRENO_RESOURCE_E_STATE;
+#endif
+#if ADRENO_COHERENT_SKIP_MAINT
+    fCoherentHow=ADRENO_COHERENT_PLAIN;
 #endif
     IORecursiveLockUnlock(fLock);
     return result;
@@ -475,6 +588,9 @@ int AdrenoMemoryMap::pinBacking(void *ctx)
 #if ADRENO_CACHE_SPARSE
     map->clearCacheMark();   // new pages: nothing about them is known to be clean (FAILURE-MODES.md C1d, C6)
 #endif
+#if ADRENO_COHERENT_SKIP_MAINT
+    map->fCoherentVerdict = 0;   // new pages: the monitor has not seen their attributes
+#endif
     return 0;
 }
 int AdrenoMemoryMap::unpinBacking(void *ctx)
@@ -489,6 +605,9 @@ int AdrenoMemoryMap::unpinBacking(void *ctx)
 #endif
 #if ADRENO_CACHE_SPARSE
     map->clearCacheMark();
+#endif
+#if ADRENO_COHERENT_SKIP_MAINT
+    map->fCoherentVerdict = 0;
 #endif
     return 0;
 }

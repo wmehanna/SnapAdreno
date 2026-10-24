@@ -20,6 +20,7 @@
 #include "../../../../compat/adreno-resource-list.h"
 #include "../../../../compat/adreno-fill-command.h"
 #include "../../../../compat/adreno-ib-command.h"
+#include "../../../../compat/adreno-coherent-skip.h"
 
 // IOGPU keeps the event machine it made in start() at this offset (IOGPU::start 0xfffffe000a8854d4,
 // str x0, [x19, #0x140]); AGXAccelerator::start reads it from the same place to call setStampBaseAddress.
@@ -161,6 +162,13 @@ public:
     // agents/resident-evict: a submission of `resource` (an IOGPUResource) found this map unadmitted; one line per map.
     void reportRefused(const void *resource);
 #endif
+#if ADRENO_COHERENT_SKIP_MAINT
+    // IO-coherent CB0 leaves (compat/adreno-coherent-skip.h): the monitor's coherency answer and attribute epoch, read at
+    // the start of every kernel command under fSubmitLock; and, per preparation, whether this map's backing is
+    // declared write-back (an IOSurface's own cache mode; IOGPU memory otherwise).
+    static void coherentRefresh();
+    void noteCoherentClass(const void *resource);
+#endif
     virtual void free() APPLE_KEXT_OVERRIDE;
     virtual bool allocGPUVirtualAddress() APPLE_KEXT_OVERRIDE;
     virtual bool reserveGPUVirtualAddress(unsigned long long address, unsigned long long length) APPLE_KEXT_OVERRIDE;
@@ -196,6 +204,12 @@ private:
     uint64_t fLastNativeStatus;
 #if ADRENO_CACHE_SPARSE
     struct adreno_cache_mark fCacheMark;
+#endif
+#if ADRENO_COHERENT_SKIP_MAINT
+    uint64_t fCoherentVerdict;     // the epoch at which every frame was found write-back; 0 none; zeroed with the backing
+    uint64_t fCoherentMaintained;  // bytes the monitor still maintained in this pass's coherent calls (their x2)
+    uint32_t fCoherentHow;         // this pass's ADRENO_COHERENT_*, read by maintainCache; all under the lock
+    bool fCoherentDeclaredWB;      // noteCoherentClass
 #endif
 #if ADRENO_RESIDENT_REPIN
     bool cleanlyRefused() const;   // caller holds the recursive lock
@@ -268,6 +282,9 @@ public:
     struct adreno_resource_list *pipelineResources() { return &fResources; }
     struct adreno_resource_list_ops pipelineOps() const
     {
+#if ADRENO_COHERENT_SKIP_MAINT
+        AdrenoMemoryMap::coherentRefresh();   // IO-coherent leaves: a pipelined IB's kernel command, under fSubmitLock
+#endif
         const struct adreno_resource_list_ops ops = {fDevice, retainResource, releaseResource, prepareResource,
                                                      completeResource, syncResource};
         return ops;
