@@ -137,6 +137,13 @@
 #ifndef ADRENO_DISPLAY_TRACE_MODES
 #define ADRENO_DISPLAY_TRACE_MODES 0
 #endif
+// --edp-backlight (agents/brightness): -DADRENO_BACKLIGHT=1 publishes AdrenoBacklight (AdrenoBacklight.h), the panel's
+// backlight service for CoreBrightness, which sets the panel's DPCD brightness through the monitor's
+// ADRENO_GUEST_BACKLIGHT (-DSNAP_EDP_BACKLIGHT=1). Needs boot-arg adreno_backlight=1 at run time too. Off by default;
+// without it this source compiles as before.
+#ifndef ADRENO_BACKLIGHT
+#define ADRENO_BACKLIGHT 0
+#endif
 #include "IOMobileGraphicsFamily26A428.h"
 #include "AdrenoDisplayPresent.h"
 #if ADRENO_PERF_FRAMES
@@ -165,6 +172,9 @@
 // adreno_display=0/1 forces it off/on. Returns false (and leaves the accelerator
 // untouched) when not created or when the display fails to start. Never fatal.
 bool AdrenoDisplayAttach(IOService *accelerator);
+#if ADRENO_BACKLIGHT
+class AdrenoBacklight;
+#endif
 
 class AdrenoDisplay : public IOMobileFramebufferLegacy
 {
@@ -246,12 +256,21 @@ public:
     virtual IOReturn set_parameter(IOMFBParameterName a0, unsigned long long const *a1, unsigned int a2) APPLE_KEXT_OVERRIDE;
     virtual IOReturn enable_disable_dithering(unsigned int a0) APPLE_KEXT_OVERRIDE;
 #endif
+#if ADRENO_BACKLIGHT
+    // Slot 397 (KDK 26A428: vtable +0xc68, diversity 0x05d1), reached from set_parameter name 1 (backlight.cpp).
+    virtual IOReturn set_brightness_gated(int value) APPLE_KEXT_OVERRIDE;
+#endif
 
 private:
 #if ADRENO_DISPLAY_TRACE_MODES
     IOReturn digitalOutMode(unsigned int colorID, unsigned int timingID);   // set_digital_out_mode's body (modeset.cpp)
     void traceSwapGeometryGated(IOSurface *surface);   // presentGated: a layer-0 swap that is not the panel's geometry
     void traceWindowGated();                           // perfLineGated: this window's calls by kind
+#endif
+#if ADRENO_BACKLIGHT
+    void backlightAttach();
+    void backlightDetach();
+    AdrenoBacklight *fBacklight;           // the published backlight service, or null (no service: brightness unchanged)
 #endif
     bool cleanQueueGated();
     void presentGated(IOMFBSwapIORequest *swap);
