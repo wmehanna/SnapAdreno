@@ -26,8 +26,15 @@ Without `PROFILE` the build is unchanged.
 | `desktop-nocoherent` | The same without coherency: sparse maintenance, the IB pipeline, GPU recovery, the present relatch, resident re-pin and aligned live-scanout copies. |
 
 Built from the commit that added them, the profiles match their deployed kexts section for section (the umbrella's
-`tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both. The file bytes also
+`tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both, and the
+`ADRENO_IB_CS_SAMPLERS` opt-in below changes `AdrenoX2.o` and `adreno-ib-command.o`. The file bytes also
 carry object paths, object times and a UUID; with `ZERO_AR_DATE=1` two builds in the same checkout are byte-identical.
+
+`ADRENO_IB_CS_SAMPLERS` (in both profiles, in `AdrenoX2` and `adreno-ib-command`) lets the IB validator admit CS
+sampler loads of up to 8 units, which CoreImage's multi-input kernels need (the folder, document and Safari icons in
+System Settings panes), and publishes `AdrenoIBComputeSamplers` so an `ADRENO_SETTINGS_ICONS` plug-in encodes them.
+Both happen only when the guest boots with `adreno_cs_samplers=1`; without it the kext validates and publishes exactly
+what a build without the define does.
 
 Licence: the source here is MIT (see `LICENSE`). The build also compiles the umbrella's
 `compat/adreno-ib-tables.h`, which is GPL-2.0-only, so a built kext is a combined work distributable under
