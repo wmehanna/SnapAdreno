@@ -26,6 +26,7 @@ Without `PROFILE` the build is unchanged.
 | `desktop-nocoherent` | The same without coherency: sparse maintenance, the IB pipeline, GPU recovery, the present relatch, resident re-pin, the head rule, the IOMFB call trace and aligned live-scanout copies. |
 | `desktop-backlight` | `desktop` plus the panel backlight service (`ADRENO_BACKLIGHT`, `src/AdrenoBacklight.h`) in `AdrenoDisplay.o`. Needs a monitor built with the umbrella's `SNAP_EDP_BACKLIGHT` and the boot-arg `adreno_backlight=1`; otherwise it behaves as `desktop`. Not deployed yet. |
 | `desktop-next` | `desktop-nocoherent` plus the same backlight service in `AdrenoDisplay.o`: the kext for an `--edp-backlight` run without `--gpu-coherent`. Without that monitor and boot-arg it behaves as `desktop-nocoherent`. Not deployed yet. |
+| `desktop-early-done` | `desktop-backlight` plus early completion (`ADRENO_PRESENT_EARLY_DONE`, below) in `AdrenoDisplay.o`: the kext for an `--edp-backlight` run with `--gpu-coherent` or `--present-early-done`. Each addition is off without its boot-arg. Not booted yet. |
 
 Built from the commit that added them, the profiles match their deployed kexts section for section (the umbrella's
 `tools/macho-sections.py`). The re-pin log fix that followed changes `AdrenoMemoryMap.o` in both, and the
