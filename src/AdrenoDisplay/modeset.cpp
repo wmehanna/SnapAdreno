@@ -106,6 +106,31 @@ bool AdrenoDisplay::start_hardware()
         else
             fHold.enabled = 0;
 #endif
+#if ADRENO_PRESENT_EARLY_DONE
+        {   // adreno_present_early_done: 0 measures only (the default), 1 always, 2 while behind for the hold; never with
+            // the release hold (its precopy keeps the swap current until the release)
+            uint32_t mode = ADRENO_EARLY_OFF, holdMs = 2000;
+            PE_parse_boot_argn("adreno_present_early_done", &mode, sizeof(mode));
+            PE_parse_boot_argn("adreno_present_early_hold_ms", &holdMs, sizeof(holdMs));
+            if (mode > ADRENO_EARLY_ADAPTIVE) mode = ADRENO_EARLY_OFF;
+            if (holdMs < 100) holdMs = 100;
+            if (holdMs > 10000) holdMs = 10000;
+#if ADRENO_LATCH
+            const bool hold = fHold.enabled;
+#else
+            const bool hold = false;
+#endif
+            uint64_t period = 0, holdTicks = 0, ms = 0;
+            nanoseconds_to_absolutetime(kVsyncPeriodNs, &period);
+            nanoseconds_to_absolutetime((uint64_t)holdMs * 1000000u, &holdTicks);
+            nanoseconds_to_absolutetime(1000000, &ms);
+            adreno_early_init(&fEarly, hold ? (uint32_t)ADRENO_EARLY_OFF : mode, period, holdTicks, ms);
+            fScreenHeld = false;
+            IOLog("AdrenoDisplay: early completion %s (mode %u%s, hold %u ms); arrivals measured\n",
+                  fEarly.mode == ADRENO_EARLY_ALWAYS ? "at every copy" : fEarly.mode == ADRENO_EARLY_ADAPTIVE ?
+                  "while WindowServer is behind" : "off", mode, hold && mode ? ", off with the release hold" : "", holdMs);
+        }
+#endif
 #if ADRENO_PRESENT_RELATCH
         {   // RL1 RL6 OP3: adreno_relatch=0 measures only; the poll and the guard in mach ticks
             uint32_t relatch = 1, pollUs = 200, guardUs = 1000;
@@ -176,6 +201,10 @@ void AdrenoDisplay::stop_hardware_gated()
 #if ADRENO_VSYNC60
     adreno_vsync_reset(&fVsync);             // S4: a restarted display starts a new grid
 #endif
+#if ADRENO_PRESENT_EARLY_DONE
+    adreno_early_reset(&fEarly);             // no tick to measure arrivals from, nothing engaged, nothing held
+    fScreenHeld = false;
+#endif
 #if ADRENO_BEAM
     adreno_beam_reset(&fBeam);               // D1: nothing armed; the next start maps and calibrates again
     beamUnmap();                             // after the timer is gone, so no fire can read the page
@@ -224,6 +253,9 @@ IOReturn AdrenoDisplay::set_digital_out_mode(unsigned int colorID, unsigned int 
 #endif
 #if ADRENO_PRESENT_RELATCH
         relatchEndGated(false);      // RL3: the beam's positions are renumbered at the recalibration
+#endif
+#if ADRENO_PRESENT_EARLY_DONE
+        adreno_early_reset(&fEarly); // and the arrivals measure from the new grid's first tick
 #endif
         return kIOReturnSuccess;
     });

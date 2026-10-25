@@ -144,6 +144,17 @@
 #ifndef ADRENO_BACKLIGHT
 #define ADRENO_BACKLIGHT 0
 #endif
+// --present-early-done (AdrenoDisplayEarlyDone.h): -DADRENO_PRESENT_EARLY_DONE=1 here only. A layer-0 swap is
+// completed right after its scanout copy instead of at the next tick (boot-arg adreno_present_early_done: 0 measures only,
+// the default; 1 always; 2 while WindowServer is behind, for adreno_present_early_hold_ms after each late frame, default
+// 2000), and a perf done line per perf window measures WindowServer's arrivals against the ticks. Not with the release
+// hold (adreno_hold=1 turns it off). Off by default; without it this source compiles as before.
+#ifndef ADRENO_PRESENT_EARLY_DONE
+#define ADRENO_PRESENT_EARLY_DONE 0
+#endif
+#if ADRENO_PRESENT_EARLY_DONE && (!ADRENO_PERF_FRAMES || !ADRENO_BEAM)
+#error "ADRENO_PRESENT_EARLY_DONE needs ADRENO_PERF_FRAMES (tick state, perf lines) and ADRENO_BEAM (latched ticks)"
+#endif
 #include "IOMobileGraphicsFamily26A428.h"
 #include "AdrenoDisplayPresent.h"
 #if ADRENO_PERF_FRAMES
@@ -163,6 +174,9 @@
 #endif
 #if ADRENO_PRESENT_RELATCH
 #include "AdrenoDisplayRelatch.h"
+#endif
+#if ADRENO_PRESENT_EARLY_DONE
+#include "AdrenoDisplayEarlyDone.h"
 #endif
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOCommandGate.h>
@@ -330,6 +344,9 @@ private:
     void relatchEndGated(bool tick);
     void relatchUrgent(bool on);
 #endif
+#if ADRENO_PRESENT_EARLY_DONE
+    bool earlyDoneNowGated();                       // complete the layer-0 swap just copied (mode and engagement)
+#endif
 
     // Kernel read-only mappings of recently presented surface allocations. Each
     // slot retains its descriptor, so the pages stay valid while mapped; the
@@ -488,6 +505,13 @@ private:
     uint32_t fRelatchCandidateID;
     struct adreno_relatch fRelatch;
     uint64_t fRelatchEarlyMark[ADRENO_RELATCH_EARLY_FIELDS];
+#endif
+#if ADRENO_PRESENT_EARLY_DONE
+    // Early completion (AdrenoDisplayEarlyDone.h): the mode, the arrival state and this window's counters. fScreenHeld:
+    // a swap copied and completed at its copy is still on screen until the next proceeding tick, so the queue (cleanQueueGated)
+    // and the pacing counters treat that refresh as they treat a current swap today.
+    struct adreno_early_done fEarly;
+    bool fScreenHeld;
 #endif
 #if ADRENO_PRESENT_CACHED_READ
     // Layer-0 sources converted to write-back by a kIOMapCopybackCache mapping (xnu converts the whole VM object,

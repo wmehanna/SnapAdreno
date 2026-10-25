@@ -30,6 +30,11 @@ bool AdrenoDisplay::cleanQueueGated()
     // family discard obsolete, no-op, aborted and dummy swaps, and report what is left.
     if (fCurrentSwap)
         return false;
+#if ADRENO_PRESENT_EARLY_DONE
+    // A swap completed at its copy is on screen until the next proceeding tick: arrivals queue as behind a current one.
+    if (fScreenHeld)
+        return false;
+#endif
     if (!fPendingSwapFirst)
         return false;
     if (dropObsoleteSwaps_gated())
@@ -50,7 +55,14 @@ void AdrenoDisplay::swap_begin_gated()
 #endif
 #if ADRENO_PERF_FRAMES
     // F1: one clock read when a swap is first seen pending on the submission path.
-    if (!fInTick && fPendingSwapFirst && !fPendingSince) fPendingSince = mach_absolute_time();
+    if (!fInTick && fPendingSwapFirst && !fPendingSince) {
+        fPendingSince = mach_absolute_time();
+#if ADRENO_PRESENT_EARLY_DONE
+        // Its arrival against the last tick, when it is the only one pending (else WindowServer is ahead of the display).
+        if (IOMFBSwapFields::layerMask(fPendingSwapFirst) & 1)
+            adreno_early_arrival(&fEarly, fPendingSince, !IOMFBSwapFields::queueNext(fPendingSwapFirst));
+#endif
+    }
 #endif
 #if ADRENO_LATCH
     // H1 H11: R, from the last release to the first arrival after it (F1's clock read; nothing if none is pending).
@@ -115,6 +127,16 @@ void AdrenoDisplay::swap_begin_gated()
                 swap_complete_gated();
                 continue;
             }
+#if ADRENO_PRESENT_EARLY_DONE
+            // Its pixels are in the scanout and nothing reads its surface again: WindowServer gets the completion now,
+            // the screen stays held (fScreenHeld) until the next tick, which then has nothing to complete.
+            if ((layers & 1) && fSwapPresented && earlyDoneNowGated()) {
+                fSwapPresented = false;
+                fScreenHeld = true;
+                adreno_early_completed(&fEarly);
+                swap_complete_gated();
+            }
+#endif
             break;                       // on screen until the next frame tick completes it
         }
         dropSwap_gated(swap, false);     // PV: aborted/rejected swaps are dropped, not shown
@@ -122,6 +144,21 @@ void AdrenoDisplay::swap_begin_gated()
     }
     armFrameTimerGated();
 }
+
+#if ADRENO_PRESENT_EARLY_DONE
+// Whether the layer-0 swap swap_begin_gated just copied is completed now (AdrenoDisplayEarlyDone.h): mode 1 always, mode 2
+// while a late frame engaged it (one clock read), never with the release hold, whose precopy keeps the swap current.
+bool AdrenoDisplay::earlyDoneNowGated()
+{
+    if (fEarly.mode == ADRENO_EARLY_OFF)
+        return false;
+#if ADRENO_LATCH
+    if (fHold.enabled || fPrecopying)
+        return false;
+#endif
+    return adreno_early_active(&fEarly, fEarly.mode == ADRENO_EARLY_ALWAYS ? 0 : mach_absolute_time());
+}
+#endif
 
 void AdrenoDisplay::armFrameTimerGated()
 {
@@ -159,7 +196,11 @@ void AdrenoDisplay::vsyncGated(IOTimerEventSource *)
     // Frame tick (emulated vsync): the swap copied during the last frame is now "displayed".
 #if ADRENO_PERF_FRAMES
     const uint64_t now = mach_absolute_time(), armed = fArmedAt, copies = fCopyTimed;   // F1: one read per tick
+#if ADRENO_PRESENT_EARLY_DONE
+    const bool completed = (fCurrentSwap && fSwapPresented) || fScreenHeld;
+#else
     const bool completed = fCurrentSwap && fSwapPresented;
+#endif
 #if ADRENO_VSYNC60
     const uint64_t grid = adreno_vsync_fired(&fVsync, now);   // S7 S8: before swap_begin_gated re-arms from it
     (void)armed;
@@ -190,6 +231,9 @@ void AdrenoDisplay::vsyncGated(IOTimerEventSource *)
         fSwapPresented = false;
         swap_complete_gated();           // family: notify_swap_done_gated, release, clear +0x1a40
     }
+#if ADRENO_PRESENT_EARLY_DONE
+    fScreenHeld = false;                 // the refresh of a swap completed at its copy ends here, as a completion would
+#endif
 #if ADRENO_PERF_FRAMES
     fInTick = true;
 #endif
@@ -212,6 +256,12 @@ void AdrenoDisplay::vsyncGated(IOTimerEventSource *)
             fHold.fallbacks++;
             holdArmReleaseGated();
         }
+    }
+#endif
+#if ADRENO_PRESENT_EARLY_DONE
+    {   // A layer-0 head still queued after the tick was deferred (present sync, copy gate): not a frame WindowServer missed.
+        const bool waiting = fPendingSwapFirst && (IOMFBSwapFields::layerMask(fPendingSwapFirst) & 1);
+        adreno_early_tick(&fEarly, now, completed, fCopyTimed != copies || waiting);
     }
 #endif
 #if ADRENO_PERF_FRAMES

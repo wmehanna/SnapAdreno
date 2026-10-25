@@ -47,6 +47,20 @@ System Settings panes), and publishes `AdrenoIBComputeSamplers` so an `ADRENO_SE
 Both happen only when the guest boots with `adreno_cs_samplers=1`; without it the kext validates and publishes exactly
 what a build without the define does.
 
+`ADRENO_PRESENT_EARLY_DONE` (`AdrenoDisplay.o`, needs `ADRENO_PERF_FRAMES` and `ADRENO_BEAM`; `src/AdrenoDisplayEarlyDone.h`)
+completes a layer-0 swap right after its scanout copy instead of at the next frame tick. WindowServer keeps at most two
+swaps outstanding and starts a frame when one completes, so the swap on screen otherwise holds one of its entries for a
+whole refresh after its pixels went out; completing at the copy frees it then, and a frame that runs longer than one
+refresh still makes the next latch (at the cost of WindowServer running up to one frame further ahead). The swap is
+still treated as on screen until the next tick, so arrivals queue exactly as before. Boot-arg
+`adreno_present_early_done`: `0` (default) measures only, `1` completes at every copy, `2` only while WindowServer is
+late (for `adreno_present_early_hold_ms`, default 2000, after each late frame). It is off with the release hold
+(`adreno_hold=1`). Every mode logs one `AdrenoDisplay: perf done s=<window>` line per perf window: completions at the
+copy, late frames (a layer-0 swap arriving within one refresh after a tick that had a frame on screen and neither copied
+nor kept a new one), adaptive engagements, arrivals behind another pending swap, and two histograms (each lone arrival's
+offset after the last tick in 2 ms bins, and each late frame's lateness in < 2 / < 4 / < 8 / more ms). The umbrella's
+`tools/test-present-early-done.py` tests it, with the presentation replay's early-done scenarios.
+
 Licence: the source here is MIT (see `LICENSE`). The build also compiles the umbrella's
 `compat/adreno-ib-tables.h`, which is GPL-2.0-only, so a built kext is a combined work distributable under
 GPL-2.0. See the umbrella's `LICENSE` and `THIRD_PARTY_NOTICES.md`.

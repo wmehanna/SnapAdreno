@@ -212,6 +212,14 @@ void AdrenoDisplay::perfLineGated(const char *why)
         IOLog("%s\n", line);
     }
 #endif
+#if ADRENO_PRESENT_EARLY_DONE
+    {   // AdrenoDisplayEarlyDone.h: completions at the copy, late frames and WindowServer's arrivals against the ticks this window
+        const int on = adreno_early_active(&fEarly, fEarly.mode == ADRENO_EARLY_ADAPTIVE ? mach_absolute_time() : 0);
+        adreno_perf_line_done(line, sizeof line, seq, &fEarly, on);
+        adreno_early_next_window(&fEarly);
+        IOLog("%s\n", line);
+    }
+#endif
 #if ADRENO_BEAM
     {   // E4: the beam's state, timing and this window's decisions
         struct adreno_beam_summary beam;

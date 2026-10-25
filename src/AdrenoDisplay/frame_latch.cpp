@@ -477,7 +477,12 @@ void AdrenoDisplay::relatchFireGated()
     fInTick = true;
     swap_begin_gated();
     fInTick = tick;
+#if ADRENO_PRESENT_EARLY_DONE
+    // the present took the GO's frame (a swap completed at its copy is no longer current, its screen is held)
+    const bool copied = !fBeam.go_row0 && ((fCurrentSwap && fSwapPresented) || fScreenHeld);
+#else
     const bool copied = !fBeam.go_row0 && fCurrentSwap && fSwapPresented;   // the present took the GO's frame
+#endif
     fBeam.go_row0 = 0;
     adreno_relatch_copied(&fRelatch, copied, row0 > pos ? adreno_beam_ticks(&fBeam, row0 - pos) : 0,
                           now > since ? now - since : 0, fBeam.ovt - ovt);
