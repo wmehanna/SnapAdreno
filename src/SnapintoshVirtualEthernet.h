@@ -6,6 +6,13 @@
 // these intentionally selected legacy KPIs local to this bring-up controller.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+// 26A428 promoted IONetworkController reserved slots 2..5 (overall vtable slots 331..334) into real
+// methods (outputStart, setInputPacketPollingEnable, pollInputPackets, networkInterfaceNotification),
+// so a vtable built against the public header references the removed _RESERVEDIONetworkController2..5
+// symbols and signs those slots with the wrong diversity. Shadow the SDK's IONetworkController.h with
+// a 26A428-correct declaration (reconstructed locally, gitignored; snapintosh-lab/tools/gen-ionet-header.py)
+// before IOEthernetController.h pulls it in.
+#include "IONetworkController26A428.h"
 #include <IOKit/network/IOEthernetController.h>
 #include <IOKit/network/IOOutputQueue.h>
 
