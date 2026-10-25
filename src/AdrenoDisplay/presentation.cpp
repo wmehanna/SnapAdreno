@@ -45,6 +45,9 @@ void AdrenoDisplay::swap_begin_gated()
     // PV swap_begin_gated 0x11aac, with one change: PV cancels and re-arms its timer on every
     // call because the host completes swaps; here the timer *is* the completion, so it is
     // armed once per frame and never pushed back by a stream of submissions.
+#if ADRENO_BACKLIGHT
+    backlightSwapGated();   // a brightness the submitted swaps carried (backlight.cpp): one atomic load if none
+#endif
 #if ADRENO_PERF_FRAMES
     // F1: one clock read when a swap is first seen pending on the submission path.
     if (!fInTick && fPendingSwapFirst && !fPendingSince) fPendingSince = mach_absolute_time();

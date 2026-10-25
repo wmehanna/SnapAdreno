@@ -4,6 +4,9 @@
 
 // ---------------------------------------------------------------- AdrenoDisplay hooks
 
+// fBacklight is used on the work loop (set_brightness_gated, backlightSwapGated), so it is set and cleared under the
+// family's command gate; the service itself is created and terminated outside it. swap_submit only tests it, outside
+// the gate, hence the atomic stores.
 void AdrenoDisplay::backlightAttach()
 {
     uint32_t on = 0;
@@ -11,15 +14,78 @@ void AdrenoDisplay::backlightAttach()
         IOLog("AdrenoBacklight: off (boot-arg adreno_backlight=1 not set): no backlight service\n");
         return;
     }
-    fBacklight = AdrenoBacklight::create(this);
+    AdrenoBacklight *b = AdrenoBacklight::create(this);
+    if (b && fLegacyCommandGate)
+        fLegacyCommandGate->runActionBlock(^IOReturn {
+            __atomic_store_n(&fBacklight, b, __ATOMIC_RELEASE);
+            return kIOReturnSuccess;
+        });
+    else
+        __atomic_store_n(&fBacklight, b, __ATOMIC_RELEASE);
 }
 
 void AdrenoDisplay::backlightDetach()
 {
+    AdrenoBacklight *b = fBacklight;
+    if (!b)
+        return;
+    if (fLegacyCommandGate)
+        fLegacyCommandGate->runActionBlock(^IOReturn {
+            __atomic_store_n(&fBacklight, (AdrenoBacklight *)nullptr, __ATOMIC_RELEASE);
+            return kIOReturnSuccess;
+        });
+    else
+        __atomic_store_n(&fBacklight, (AdrenoBacklight *)nullptr, __ATOMIC_RELEASE);
+    b->terminate();
+    b->release();
+}
+
+// The client's swap record (IOMFBSwapRec): IOMobileFramebufferUserClient::swap_submit accepts exactly 0x6e0 bytes and
+// passes them unchanged to the virtual swap_submit below (KDK 26A428, VERIFIED). IOMobileFramebuffer.framework clears
+// the record in kern_SwapBegin and submits it in kern_SwapEnd; IOMobileFramebufferSwapSetBrightness sets the byte at
+// kSwapBrightnessPresent to 1 and stores the nits as an IEEE double at kSwapBrightnessNits, unaligned in the packed
+// record (dyld cache 26A428, VERIFIED). The family's own swap_submit reads neither. A swap without a new value leaves
+// the byte 0, so the panel is only asked for anything when CoreAnimation's brightness changed.
+static constexpr size_t kSwapRecordSize = 0x6e0;
+static constexpr size_t kSwapBrightnessPresent = 0x354;
+static constexpr size_t kSwapBrightnessNits = 0x35e;
+static_assert(kSwapBrightnessNits + sizeof(uint64_t) <= kSwapRecordSize, "the brightness lies inside the record");
+static constexpr uint64_t kSwapNitsPending = 1ull << 63;   // fSwapNits: a value not yet handed to AdrenoBacklight
+
+// Slot 284. Runs on the submitting client's thread, outside the gate, for every swap: it only reads the record and
+// leaves the value in fSwapNits (the newest wins), so the swap path never waits on the backlight; swap_begin_gated
+// hands it on under the gate. Without a service (boot-arg off, or a monitor that refused) it reads nothing. The
+// family's answer is returned unchanged.
+uint64_t AdrenoDisplay::swap_submit(IOMFBSwapRec *rec, IOUserClient *client, unsigned int *swapID)
+{
+    const uint8_t *r = (const uint8_t *)rec;
+    if (r && __atomic_load_n(&fBacklight, __ATOMIC_RELAXED) && r[kSwapBrightnessPresent]) {
+        uint64_t bits, q16;
+        __builtin_memcpy(&bits, r + kSwapBrightnessNits, sizeof(bits));
+        if (!edp_bl_double_to_q16(bits, (uint64_t)EDP_BL_NITS_LIMIT_MAX << 16, &q16))
+            __atomic_store_n(&fSwapNits, q16 | kSwapNitsPending, __ATOMIC_RELEASE);
+        else
+            __atomic_add_fetch(&fSwapNitsRejected, 1, __ATOMIC_RELAXED);
+    }
+    return IOMobileFramebufferLegacy::swap_submit(rec, client, swapID);
+}
+
+// Under the gate, from swap_begin_gated: the newest swap brightness (and the count of unusable ones) to AdrenoBacklight,
+// which coalesces and rate-limits the monitor calls. Costs one atomic load when nothing changed.
+void AdrenoDisplay::backlightSwapGated()
+{
+    const uint32_t rejected = __atomic_load_n(&fSwapNitsRejected, __ATOMIC_RELAXED);
+    if (!(__atomic_load_n(&fSwapNits, __ATOMIC_RELAXED) & kSwapNitsPending) && rejected == fSwapNitsRejectedSeen)
+        return;
+    const uint64_t v = __atomic_exchange_n(&fSwapNits, 0, __ATOMIC_ACQUIRE);
+    const uint32_t newlyRejected = rejected - fSwapNitsRejectedSeen;
+    fSwapNitsRejectedSeen = rejected;
     if (!fBacklight)
         return;
-    fBacklight->terminate();
-    OSSafeReleaseNULL(fBacklight);
+    if (newlyRejected)
+        fBacklight->noteSwapRejected(newlyRejected);
+    if (v & kSwapNitsPending)
+        fBacklight->requestNits(v & ~kSwapNitsPending, AdrenoBacklight::kSourceSwap);
 }
 
 // IOMobileFramebufferLegacy::set_parameter (KDK 26A428 0x2cd70): parameter name 1 with one value runs this, through
@@ -46,7 +112,7 @@ IOReturn AdrenoDisplay::set_brightness_gated(int value)
 OSDefineMetaClassAndStructors(AdrenoBacklight, IOService)
 
 static const char *const kBacklightSources[AdrenoBacklight::kSources] = {"brightness-nits", "brightness",
-                                                                        "IOMFB parameter 1"};
+                                                                        "IOMFB parameter 1", "swap"};
 
 static const char *backlightState(uint32_t state)
 {
@@ -122,7 +188,7 @@ AdrenoBacklight *AdrenoBacklight::create(IOService *display)
     }
     b->registerService();
     uint64_t now = edp_bl_level_to_nits(b->fLevel, b->fMaxNits, b->fMax);
-    IOLog("AdrenoBacklight: published (backlight-control, force-brightness-control): %llu.%03llu..%u nits, level = "
+    IOLog("AdrenoBacklight: published (backlight-control): %llu.%03llu..%u nits, level = "
           "nits * %u / %u in levels %u..%u, panel level %u (%llu.%03llu nits)%s\n", b->fMinQ16 >> 16,
           milli(b->fMinQ16 & 0xffff), b->fMaxNits, b->fMax, b->fMaxNits, b->fFloor, b->fMax, b->fLevel, now >> 16,
           milli(now & 0xffff), state == EDP_BL_STATE_MODE ? "; the first change switches the panel to DPCD mode" : "");
@@ -168,15 +234,12 @@ bool AdrenoBacklight::start(IOService *provider)
 {
     if (!super::start(provider))
         return false;
-    // What BrightnessControl reads from a backlight service (AdrenoBacklight.h, steps 2 and 3). The 16.16 luminance
-    // products are the J700 backlight node's property names; their values are this panel's nominal range, its mid
-    // point CoreBrightness's usual 140 nits (INFERRED). force-brightness-control is read as OSData, first byte only,
-    // the way the device tree would carry it: without it BCAppleBacklightBrtControl never writes brightness-nits here.
-    static const uint8_t kForceBrightnessControl[4] = {1, 0, 0, 0};
+    // What BrightnessControl reads from a backlight service (AdrenoBacklight.h, step 2): enough for WindowServer to bind
+    // the panel's IOMFB to it, which gives CoreAnimation the brightness control whose values arrive in the swaps. The
+    // 16.16 luminance products are the J700 backlight node's property names; their values are this panel's nominal
+    // range, its mid point CoreBrightness's usual 140 nits (INFERRED).
     uint64_t mid = 140ull << 16, top = (uint64_t)fMaxNits << 16;
     mid = mid < fMinQ16 ? fMinQ16 : mid > top ? top : mid;
-    if (!setProperty("force-brightness-control", (void *)kForceBrightnessControl, sizeof(kForceBrightnessControl)))
-        return false;
     setProperty("backlight-control", kOSBooleanTrue);
     setProperty("LminProduct", (unsigned long long)fMinQ16, 32);
     setProperty("LmidProduct", (unsigned long long)mid, 32);
@@ -265,6 +328,13 @@ IOReturn AdrenoBacklight::requestNits(uint64_t nits_q16, Source source)
     return kIOReturnSuccess;
 }
 
+void AdrenoBacklight::noteSwapRejected(uint32_t count)
+{
+    IOLockLock(fLock);
+    fRejectedSwap += count;
+    IOLockUnlock(fLock);
+}
+
 // On fWorkLoop: one monitor call for the latest request.
 void AdrenoBacklight::apply(IOTimerEventSource *)
 {
@@ -332,7 +402,7 @@ void AdrenoBacklight::publish()
     uint64_t top = (uint64_t)fMaxNits << 16, q = edp_bl_level_to_nits(fLevel, fMaxNits, fMax);
     q = q < fMinQ16 ? fMinQ16 : q > top ? top : q;
     OSDictionary *params = OSDictionary::withCapacity(2), *slider = OSDictionary::withCapacity(3),
-                 *nits = OSDictionary::withCapacity(3), *diag = OSDictionary::withCapacity(16);
+                 *nits = OSDictionary::withCapacity(3), *diag = OSDictionary::withCapacity(24);
     bool ok = params && slider && nits && diag && putNum(slider, "min", 0) &&
               putNum(slider, "max", EDP_BL_SLIDER_MAX) &&
               putNum(slider, "value", edp_bl_nits_to_slider(q, fMinQ16, top)) &&
@@ -348,8 +418,9 @@ void AdrenoBacklight::publish()
     if (ok)
         setProperty("IODisplayParameters", params);
     IOLockLock(fLock);
-    uint64_t requests[kSources] = {fRequests[0], fRequests[1], fRequests[2]};
-    uint64_t applied = fApplied, clamped = fClamped, errors = fErrors, coalesced = fCoalesced, unchanged = fUnchanged;
+    uint64_t requests[kSources] = {fRequests[0], fRequests[1], fRequests[2], fRequests[3]};
+    uint64_t applied = fApplied, clamped = fClamped, errors = fErrors, coalesced = fCoalesced, unchanged = fUnchanged,
+             rejectedSwap = fRejectedSwap;
     int64_t lastError = fLastError;
     bool stopped = fStopped;
     IOLockUnlock(fLock);
@@ -360,7 +431,9 @@ void AdrenoBacklight::publish()
                                 (uint32_t)fCaps[3] << 24, 64) &&
         putNum(diag, "RequestsNits", requests[kSourceNits], 64) &&
         putNum(diag, "RequestsBrightness", requests[kSourceSlider], 64) &&
-        putNum(diag, "RequestsIOMFB", requests[kSourceIOMFB], 64) && putNum(diag, "Applied", applied, 64) &&
+        putNum(diag, "RequestsIOMFB", requests[kSourceIOMFB], 64) &&
+        putNum(diag, "RequestsSwap", requests[kSourceSwap], 64) && putNum(diag, "RejectedSwap", rejectedSwap, 64) &&
+        putNum(diag, "Applied", applied, 64) &&
         putNum(diag, "Clamped", clamped, 64) && putNum(diag, "Errors", errors, 64) &&
         putNum(diag, "Coalesced", coalesced, 64) && putNum(diag, "Unchanged", unchanged, 64) &&
         putNum(diag, "LastError", (uint64_t)lastError, 64) &&

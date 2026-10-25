@@ -259,6 +259,9 @@ public:
 #if ADRENO_BACKLIGHT
     // Slot 397 (KDK 26A428: vtable +0xc68, diversity 0x05d1), reached from set_parameter name 1 (backlight.cpp).
     virtual IOReturn set_brightness_gated(int value) APPLE_KEXT_OVERRIDE;
+    // Slot 284 (KDK 26A428: diversity 0x7dea), every client swap record on its way to the family: the brightness a swap
+    // carries goes to AdrenoBacklight (backlight.cpp). Returns the family's answer.
+    virtual uint64_t swap_submit(IOMFBSwapRec *rec, IOUserClient *client, unsigned int *swapID) APPLE_KEXT_OVERRIDE;
 #endif
 
 private:
@@ -270,7 +273,11 @@ private:
 #if ADRENO_BACKLIGHT
     void backlightAttach();
     void backlightDetach();
+    void backlightSwapGated();             // swap_begin_gated: the newest swap brightness to fBacklight
     AdrenoBacklight *fBacklight;           // the published backlight service, or null (no service: brightness unchanged)
+    uint64_t fSwapNits;                    // 16.16 nits | pending bit, written by swap_submit on any thread (atomic)
+    uint32_t fSwapNitsRejected;            // swap brightness values that named no brightness (atomic counter)
+    uint32_t fSwapNitsRejectedSeen;        // ... of which fBacklight was told (gate)
 #endif
     bool cleanQueueGated();
     void presentGated(IOMFBSwapIORequest *swap);
