@@ -7,8 +7,6 @@
 // Part of AdrenoX2.cpp's translation unit: included from it, never compiled on its own.
 #if ADRENO_SOFTGPU
 
-#include <pexpert/pexpert.h>
-
 struct AdrenoSoftGPU {
     IOMemoryMap *reg;
     volatile uint8_t *base;
@@ -338,15 +336,24 @@ void AdrenoAcceleratorX2::softgpuStop()
 }
 
 // F1: FILL_BUFFER over a memory object made from the boot console's first 64 rows (the panel). A fill writes one byte
-// everywhere (sgpu_fill_buffer.value is the fill byte), so the rows end up as 0xc0 bytes (softgpu_selftest_byte).
+// everywhere (sgpu_fill_buffer.value is the fill byte), so the rows end up as 0xc0 bytes (softgpu_selftest_byte), not the
+// plan's 0xff3080c0 pixel.
 void AdrenoAcceleratorX2::softgpuSelfTest()
 {
     AdrenoSoftGPU *s = fSoft;
-    PE_Video video = {};
+    // The panel is ramfb in guest RAM: its physical base is the run log's "panel 2880x1800x32 (BGR) at ..." line, handed in
+    // as softgpu_selftest_pa (PE_current_console is not a KPI here, and AdrenoDisplay's scanout comes from the family).
+    uint64_t pa = 0, rowBytes = 0;
+    uint32_t row32 = 11520;
     uint32_t fillByte = 0xc0;
     PE_parse_boot_argn("softgpu_selftest_byte", &fillByte, sizeof fillByte);
-    if (PE_current_console(&video) || !video.v_baseAddr || !video.v_rowBytes) { ALOG("SoftGPU: self-test: no boot console"); return; }
-    const uint64_t pa = video.v_baseAddr, bytes = (uint64_t)video.v_rowBytes * 64;
+    PE_parse_boot_argn("softgpu_selftest_row", &row32, sizeof row32);
+    rowBytes = row32;
+    if (!PE_parse_boot_argn("softgpu_selftest_pa", &pa, sizeof pa) || !pa || !rowBytes) {
+        ALOG("SoftGPU: self-test: boot-arg softgpu_selftest_pa=<panel physical address> missing");
+        return;
+    }
+    const uint64_t bytes = rowBytes * 64;
     struct sgpu_mem_run run = {pa & ~0xfffull, ((pa & 0xfff) + bytes + 0xfff) & ~0xfffull};
     const uint32_t id = s->nextMem++;
     int r = sgCreateMemory(s, id, 0, bytes, (uint32_t)(pa & 0xfff), &run, 1);
