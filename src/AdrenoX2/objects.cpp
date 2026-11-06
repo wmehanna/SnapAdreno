@@ -122,6 +122,14 @@ int AdrenoCommandQueue::ib(void *context, const void *command, uint64_t bytes)
         OSDynamicCast(AdrenoSegmentList,submission->list),command,bytes) : ADRENO_SUBMIT_E_INACTIVE;
 #endif
 }
+#if ADRENO_SOFTGPU
+int AdrenoCommandQueue::stream(void *context, const void *command, uint64_t bytes)
+{
+    auto *submission=static_cast<AdrenoFenceContext *>(context);
+    return submission->accelerator ? submission->accelerator->submitStream(
+        OSDynamicCast(AdrenoSegmentList,submission->list),command,bytes) : ADRENO_SUBMIT_E_INACTIVE;
+}
+#endif
 IOGPUSegmentResourceList *AdrenoCommandQueue::parseSegmentList(IOGPUDevice *device,
                                                                IOGPUSegmentResourceListHeader const *header,
                                                                IOGPUDeviceShmem *shmem)
@@ -146,7 +154,11 @@ void AdrenoCommandQueue::processSegmentKernelCommand(IOGPUSegmentResourceList *l
     AdrenoFenceContext submission={fAccelerator,list};
 #endif
     // FENCE, FILL32 and ADRENO_KCMD_IB, decoded by the same pure-C dispatcher the host tests drive.
+#if ADRENO_SOFTGPU
+    const struct adreno_kernel_ops ops={&submission,fence,fill,ib,stream};   // + SOFTGPU_KCMD_STREAM
+#else
     const struct adreno_kernel_ops ops={&submission,fence,fill,ib};
+#endif
     int result = adreno_kernel_command(command, limit >= start ? limit-start : 0, &ops);
     if (result == ADRENO_SUBMIT_GENERIC) {
         IOGPUCommandQueue::processSegmentKernelCommand(list, command, end, segmentStart, segmentEnd, args);
@@ -161,6 +173,14 @@ void AdrenoCommandQueue::processSegmentKernelCommand(IOGPUSegmentResourceList *l
             if (auto *resources=OSDynamicCast(AdrenoSegmentList,list))
                 resources->retainAfterTimeout();
         }
+#if ADRENO_SOFTGPU
+        if (result<0 && result>=SGPU_E_SKIPPED) {
+            // A SoftGPU descriptor result: IOGPU's status per spec 1.6 (hang, victim, page fault, invalid).
+            setSubmissionError(sgpu_guest_iogpu_status(result));
+            if (fAccelerator) fAccelerator->noteCommandFailure(result);
+            return;
+        }
+#endif
 #if ADRENO_GPU_RECOVER
         // R26: the guilty command buffer of a reset gets IOGPU's hang status (3, 0xb after a fault; IOGPU counts the
         // strike), one refused while latched is a victim (5); everything else keeps 0xa.

@@ -514,6 +514,48 @@ int AdrenoMemoryMap::resolveRange(uint64_t offset, uint64_t bytes, uint64_t *add
     return result;
 }
 
+#if ADRENO_SOFTGPU
+uint64_t AdrenoMemoryMap::softgpuLogicalBytes() const
+{
+    uint64_t head=0;
+#if ADRENO_RESIDENT_HEAD_OFFSET
+    head=fBackingHead;
+#endif
+    return fResource.logical_length>head ? fResource.logical_length-head : 0;
+}
+// The memory object of a SoftGPU stream (spec 2.3): the pinned backing's runs in map order, whole 4 KiB pages. The map
+// is prepared by the submitting list, so it stays pinned while the runs are used; the lock only orders the reads.
+int AdrenoMemoryMap::softgpuRuns(struct sgpu_mem_run *runs, uint32_t cap, uint32_t *n, uint32_t *head, uint64_t *size)
+{
+    if (!fLock) return SGPU_E_OBJECT;
+    int result=SGPU_E_STATE;
+    *n=0;
+    *head=0;
+    *size=0;
+    IORecursiveLockLock(fLock);
+    if (fBacking && fResource.flags==(ADRENO_RESOURCE_RESERVED|ADRENO_RESOURCE_PINNED) && fResource.logical_length &&
+        fResource.mapped_length==fResource.length) {
+        const uint64_t span=fResource.logical_length;
+        result=0;
+        for (uint64_t offset=0; offset<span && !result;) {
+            uint64_t length=0;
+            const uint64_t pa=physicalPage(this,offset,&length);
+            if (!pa || !length || (pa&0xfff)) { result=SGPU_E_MEMORY; break; }
+            if (length>span-offset) length=span-offset;
+            result=sgpu_guest_runs_add(runs,n,cap,pa,(length+0xfff)&~0xfffull);
+            offset+=length;
+        }
+#if ADRENO_RESIDENT_HEAD_OFFSET
+        *head=static_cast<uint32_t>(fBackingHead);
+#endif
+        *size=softgpuLogicalBytes();
+        if (!result && !*size) result=SGPU_E_STATE;
+    }
+    IORecursiveLockUnlock(fLock);
+    return result;
+}
+#endif
+
 AdrenoMemoryMap *AdrenoMemoryMap::withMapper(IOMapper *mapper)
 {
     if (!mapper) return nullptr;
@@ -907,6 +949,13 @@ void AdrenoMemoryMap::releaseFromGPUPageTable()
     workAdd(kWorkUnwireTicks, mach_absolute_time() - unwireStart);
 #endif
     if (error) MLOG("clear/unpin failed %d native=0x%llx; retaining resource", error, fLastNativeStatus);
+#if ADRENO_SOFTGPU
+    // The pages are no longer pinned: the host must drop its alias before the guest reuses them (sent later, 2.6).
+    if (fSoftGPUId && !(fResource.flags&ADRENO_RESOURCE_PINNED)) {
+        AdrenoSoftGPUMapGone(fSoftGPUId,fSoftGPUEpoch);
+        fSoftGPUId=0;
+    }
+#endif
     if (__atomic_load_n(&gResidency.refused, __ATOMIC_RELAXED) &&
         !__atomic_exchange_n(&gResidencyFullLogged, 1, __ATOMIC_RELAXED))
         MLOG("resident budget %llu MiB full: %llu bytes, retained %llu, reused %llu, evicted %llu",
@@ -956,6 +1005,9 @@ void AdrenoMemoryMap::free()
     if (fLock) {
         IORecursiveLockLock(fLock);
         bool released = releaseAddress();
+#if ADRENO_SOFTGPU
+        if (released && fSoftGPUId) { AdrenoSoftGPUMapGone(fSoftGPUId,fSoftGPUEpoch); fSoftGPUId=0; }
+#endif
         IORecursiveLockUnlock(fLock);
         if (!released) return; // keep native task/memory refs and backing until reboot
         IORecursiveLockFree(fLock); fLock = nullptr;

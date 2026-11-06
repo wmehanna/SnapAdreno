@@ -105,6 +105,17 @@ extern "C" uint64_t AdrenoGPUMapBudget(void);   // AdrenoMemoryMap.cpp: the resi
 #if ADRENO_RESIDENT_HEAD_OFFSET && !ADRENO_RESIDENT_REPIN
 #error "ADRENO_RESIDENT_HEAD_OFFSET needs ADRENO_RESIDENT_REPIN (the tail rule it extends and the clean refusal)"
 #endif
+// plans/p6-softgpu-integration.md W2 (-DADRENO_SOFTGPU=1 in AdrenoX2.o, AdrenoMemoryMap.o and AdrenoSegmentList.o): the QEMU
+// SoftGPU device's descriptor ring behind SOFTGPU_KCMD_STREAM (0x1010), found through the ADT property
+// snapintosh,softgpu-reg (AdrenoX2/softgpu.cpp). Without the property the kext is today's kext. Off by default; without
+// it this source compiles as before.
+#ifndef ADRENO_SOFTGPU
+#define ADRENO_SOFTGPU 0
+#endif
+#if ADRENO_SOFTGPU
+#include "../../../../compat/softgpu-guest.h"
+extern "C" void AdrenoSoftGPUMapGone(uint32_t id, uint64_t epoch);   // AdrenoX2.cpp: a map gave up its backing
+#endif
 #if ADRENO_PIPELINE
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -171,6 +182,23 @@ public:
 #endif
     int resolveFill(uint64_t offset, uint64_t bytes, uint64_t *address);
     int resolveRange(uint64_t offset, uint64_t bytes, uint64_t *address);   // IB relocations (design 3.2)
+#if ADRENO_SOFTGPU
+    // The SoftGPU memory object of this map (AdrenoX2/softgpu.cpp): its id when it belongs to `epoch`, else 0.
+    uint32_t softgpuId(uint64_t epoch) const
+    {
+        return __atomic_load_n(&fSoftGPUEpoch, __ATOMIC_ACQUIRE) == epoch ? __atomic_load_n(&fSoftGPUId, __ATOMIC_ACQUIRE) : 0;
+    }
+    void softgpuSet(uint32_t id, uint64_t epoch)
+    {
+        __atomic_store_n(&fSoftGPUEpoch, epoch, __ATOMIC_RELEASE);
+        __atomic_store_n(&fSoftGPUId, id, __ATOMIC_RELEASE);
+    }
+    uint64_t softgpuSpan() const { return fResource.logical_length; }          // map extent, an upper bound for the runs
+    uint64_t softgpuLogicalBytes() const;                                     // the extent past the head
+    uint32_t softgpuReadOnly() const { return fBackingDirection == kIODirectionOut; }
+    // Physical runs of the pinned backing in map order, coalesced, whole 4 KiB pages: 0 or an SGPU_E_* status.
+    int softgpuRuns(struct sgpu_mem_run *runs, uint32_t cap, uint32_t *n, uint32_t *head, uint64_t *size);
+#endif
 #if ADRENO_RESIDENT_REPIN
     // agents/resident-evict: a submission of `resource` (an IOGPUResource) found this map unadmitted; one line per map.
     void reportRefused(const void *resource);
@@ -231,6 +259,10 @@ private:
     uint32_t fRefusalStatus;       // its native status
     uint32_t fRefusalReported;     // reportRefused has logged this map
 #endif
+#if ADRENO_SOFTGPU
+    uint64_t fSoftGPUEpoch;        // the device epoch fSoftGPUId belongs to (a reset forgets every id by this tag)
+    uint32_t fSoftGPUId;           // memory object id, 0 none; sent as DESTROY_MEMORY when the backing is unpinned
+#endif
 #if ADRENO_RESIDENT_HEAD_OFFSET
     // The head rule (adreno-resource-tail.h): called by pinBacking after the wire, under the lock; on refusal it has
     // completed and released the backing. *head: the descriptor's offset in its first page.
@@ -286,6 +318,18 @@ private:
     static int resolveRange(void *, void *, void *, uint64_t, uint64_t, uint64_t *);
 public:
     void retainAfterTimeout();
+#if ADRENO_SOFTGPU
+    // The prepared entries in list order (binding-table order): their maps and IOGPU usage bits.
+    uint64_t entryCount() const { return fResources.ready ? fResources.count : 0; }
+    bool entryAt(uint64_t i, AdrenoMemoryMap **map, uint32_t *usage, uint32_t *id) const
+    {
+        if (i >= entryCount() || !fResources.entries[i].preparation) return false;
+        *map = static_cast<AdrenoMemoryMap *>(fResources.entries[i].preparation);
+        *usage = fResources.entries[i].usage;
+        *id = fResources.entries[i].id;
+        return true;
+    }
+#endif
     int submit(int (*work)(void *), void *context);
     int fill(const struct adreno_fill32_request *,
              int (*transfer)(void *, uint64_t, uint64_t, uint32_t), void *context);
@@ -350,6 +394,9 @@ private:
     static int fence(void *context);
     static int fill(void *context, const struct adreno_fill32_request *);
     static int ib(void *context, const void *command, uint64_t bytes);
+#if ADRENO_SOFTGPU
+    static int stream(void *context, const void *command, uint64_t bytes);   // SOFTGPU_KCMD_STREAM
+#endif
     AdrenoAcceleratorX2 *fAccelerator;
 };
 
@@ -369,6 +416,9 @@ public:
     void pipelineTimerFired();
 #else
     int submitIB(AdrenoSegmentList *, const void *command, uint64_t bytes);   // ADRENO_KCMD_IB
+#endif
+#if ADRENO_SOFTGPU
+    int submitStream(AdrenoSegmentList *, const void *command, uint64_t bytes);   // SOFTGPU_KCMD_STREAM (softgpu.cpp)
 #endif
     void noteCommandFailure(int result);   // rate-limited log of kernel commands completed with error 0xa
 #if ADRENO_GPU_RECOVER
@@ -393,6 +443,14 @@ public:
     virtual IOGPUCommandQueue *newCommandQueue() APPLE_KEXT_OVERRIDE;
 
 private:
+#if ADRENO_SOFTGPU
+    void softgpuStart(IOService *provider);   // maps the device, brings it up; absent in the ADT: nothing changes
+    void softgpuStop();
+    bool softgpuBringUp(bool first);          // spec 1.9; fSubmitLock held
+    void softgpuLost(int why);                // RESET_DEVICE and a new epoch; fSubmitLock held
+    void softgpuSelfTest();                   // boot-arg softgpu_selftest=1; fSubmitLock held
+    struct AdrenoSoftGPU *fSoft;
+#endif
     bool prepareStampDMA();
     int probeGuestFence();   // 0, ADRENO_SUBMIT_E_INACTIVE (refused before the ring) or ADRENO_SUBMIT_E_UNCERTAIN
 #if ADRENO_GPU_RECOVER

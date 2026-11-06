@@ -170,6 +170,9 @@ bool AdrenoAcceleratorX2::start(IOService *provider)
     pipelineStart(em);   // agents/gpu-pipeline: optional; off leaves every IB synchronous
 #endif
 
+#if ADRENO_SOFTGPU
+    softgpuStart(provider);   // before the publish: the plug-in reads SoftGPUEpoch; the device is absent on the A16
+#endif
     setProperty("model", "Adreno X2-90");
     if (AdrenoEarlyStopEnabled())   // before the publish notification the plug-in's device creation follows
         setProperty(ADRENO_EARLY_STOP_REGISTRY_PROPERTY, 1ULL, 32);
@@ -190,6 +193,9 @@ bool AdrenoAcceleratorX2::start(IOService *provider)
 
 void AdrenoAcceleratorX2::free()
 {
+#if ADRENO_SOFTGPU
+    softgpuStop();
+#endif
 #if ADRENO_PIPELINE
     pipelineStop();      // O2: no flight left on the arena below
 #endif

@@ -268,3 +268,4 @@ OSDefineMetaClassAndStructors(AdrenoAcceleratorX2, IOGPU)
 #include "AdrenoX2/submission.cpp"
 #include "AdrenoX2/pipeline.cpp"
 #include "AdrenoX2/lifecycle.cpp"
+#include "AdrenoX2/softgpu.cpp"

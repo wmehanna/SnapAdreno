@@ -26,7 +26,10 @@ FIXES="-DADRENO_PRESENT_LIVE_ALIGNED=1"
 # Per-unit defines, empty in the default build. A profile sets FIXES (usually empty: it names every define per unit)
 # and the U_* sets.
 U_AdrenoX2= U_AdrenoMemoryMap= U_AdrenoSegmentList= U_AdrenoDisplay= U_SnapintoshVirtualEthernet= U_AdrenoEarlyStop=
-U_adreno_resource= U_adreno_submit= U_adreno_resource_list= U_adreno_fill_command= U_adreno_ib_command= U_kmod_info=
+U_adreno_resource= U_adreno_submit= U_adreno_resource_list= U_adreno_fill_command= U_adreno_ib_command= U_kmod_info= U_softgpu_guest=
+# A profile sets SOFTGPU=1 for the SoftGPU transport (compat/softgpu-guest.c is linked) and PLUGIN/PLUGIN_CLASS to rename the
+# Metal plug-in in the personality (profiles/softgpu.sh).
+SOFTGPU= PLUGIN= PLUGIN_CLASS=
 if [ -n "$PROFILE" ]; then
     case "$PROFILE" in */*|.*) echo "error: PROFILE is a name in $D/profiles" >&2; exit 2;; esac
     [ -f "$D/profiles/$PROFILE.sh" ] || { echo "error: no profile $D/profiles/$PROFILE.sh" >&2; exit 2; }
@@ -45,13 +48,20 @@ xcrun clang $COMMON $U_adreno_submit -c "$D/../../../compat/adreno-submit.c" -o 
 xcrun clang $COMMON $U_adreno_resource_list -c "$D/../../../compat/adreno-resource-list.c" -o "$OBJ/adreno-resource-list.o"
 xcrun clang $COMMON $U_adreno_fill_command -c "$D/../../../compat/adreno-fill-command.c" -o "$OBJ/adreno-fill-command.o"
 xcrun clang $COMMON $U_adreno_ib_command -c "$D/../../../compat/adreno-ib-command.c" -o "$OBJ/adreno-ib-command.o"
+[ -z "$SOFTGPU" ] || xcrun clang $COMMON $U_softgpu_guest -c "$D/../../../compat/softgpu-guest.c" -o "$OBJ/softgpu-guest.o"
 xcrun clang $COMMON $U_kmod_info -c "$D/src/kmod_info.c" -o "$OBJ/kmod_info.o"
 K=$O/AdrenoX2.kext
 rm -rf "$K"; mkdir -p "$K/Contents/MacOS"
 cp "$D/Info.plist" "$K/Contents/Info.plist"
+if [ -n "$PLUGIN" ]; then
+    sed -e "s|<string>AdrenoMetal</string>|<string>$PLUGIN</string>|" -e "s|<string>AdrenoMTLDevice</string>|<string>$PLUGIN_CLASS</string>|" \
+        "$D/Info.plist" > "$K/Contents/Info.plist"
+    grep -q "<string>$PLUGIN</string>" "$K/Contents/Info.plist" && grep -q "<string>$PLUGIN_CLASS</string>" "$K/Contents/Info.plist" ||
+        { echo "error: Info.plist has no MetalPluginName to rename" >&2; exit 2; }
+fi
 xcrun clang++ -target arm64e-apple-macos27.0 -isysroot "$SDK" -mkernel -nostdlib -Xlinker -kext \
   -Xlinker -export_dynamic -o "$K/Contents/MacOS/AdrenoX2" "$OBJ/AdrenoX2.o" "$OBJ/AdrenoMemoryMap.o" \
-  "$OBJ/AdrenoSegmentList.o" "$OBJ/AdrenoDisplay.o" "$OBJ/SnapintoshVirtualEthernet.o" "$OBJ/AdrenoEarlyStop.o" "$OBJ/adreno-resource.o" "$OBJ/adreno-submit.o" "$OBJ/adreno-resource-list.o" "$OBJ/adreno-fill-command.o" "$OBJ/adreno-ib-command.o" "$OBJ/kmod_info.o" \
+  "$OBJ/AdrenoSegmentList.o" "$OBJ/AdrenoDisplay.o" "$OBJ/SnapintoshVirtualEthernet.o" "$OBJ/AdrenoEarlyStop.o" "$OBJ/adreno-resource.o" "$OBJ/adreno-submit.o" "$OBJ/adreno-resource-list.o" "$OBJ/adreno-fill-command.o" "$OBJ/adreno-ib-command.o" ${SOFTGPU:+"$OBJ/softgpu-guest.o"} "$OBJ/kmod_info.o" \
   -L"$SDK/usr/lib" -lkmodc++ -lkmod -lcc_kext
 codesign -f -s - "$K"
 if [ -n "$PROFILE" ]; then
@@ -59,7 +69,7 @@ if [ -n "$PROFILE" ]; then
     {
         echo "profile $PROFILE"
         for u in AdrenoX2 AdrenoMemoryMap AdrenoSegmentList AdrenoDisplay SnapintoshVirtualEthernet AdrenoEarlyStop \
-                 adreno_resource adreno_submit adreno_resource_list adreno_fill_command adreno_ib_command kmod_info; do
+                 adreno_resource adreno_submit adreno_resource_list adreno_fill_command adreno_ib_command softgpu_guest kmod_info; do
             eval "set -- $FIXES \$U_$u"; echo "$u: $*"
         done
     } > "$O/DEFINES.txt"
