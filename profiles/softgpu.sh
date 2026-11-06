@@ -5,7 +5,8 @@
 #
 # At run time the transport exists only when the ADT names the device (snapintosh,softgpu-reg, written by the monitor under
 # SNAP_SOFTGPU=1); without it this kext is desktop-next's, apart from the plug-in name. Boot-args: softgpu_selftest=1 fills
-# the panel's first 64 rows with softgpu_selftest_byte (default 0xc0) through the device at start. Rollback is the old KC.
+# the 64 rows at softgpu_selftest_pa=<hex panel address> (row softgpu_selftest_row, default 11520) with softgpu_selftest_byte
+# (default 0xc0) through the device at start. Rollback is the old KC.
 . "$D/profiles/desktop-next.sh"
 PROFILE_SOFTGPU="-DADRENO_SOFTGPU=1"
 U_AdrenoX2="$U_AdrenoX2 $PROFILE_SOFTGPU"
