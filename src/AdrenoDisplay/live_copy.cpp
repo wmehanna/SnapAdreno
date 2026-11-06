@@ -65,8 +65,16 @@ void AdrenoDisplay::presentGated(IOMFBSwapIORequest *swap)
 #endif
             error = ADRENO_DISPLAY_E_ARGS;
             if (map) {
-                source = {(const uint8_t *)map->getVirtualAddress(), map->getLength(), surface->getBaseOffset(),
-                    fLastSurfaceRowBytes, fLastSurfaceWidth, fLastSurfaceHeight, fLastFormat};
+                uint64_t offset = surface->getBaseOffset();
+                uint64_t rowBytes = fLastSurfaceRowBytes;
+                if (fLastFormat == ADRENO_DISPLAY_FORMAT_B38) {
+                    // The plug-in writes this plane as one linear image of 64-byte aligned rows
+                    // (AdrenoCompressedSurfaceRow), not as its declared 16x16 elements.
+                    rowBytes = ((uint64_t)fLastSurfaceWidth * 4 + 63) & ~(uint64_t)63;
+                    offset += surface->getPlaneOffset(0);
+                }
+                source = {(const uint8_t *)map->getVirtualAddress(), map->getLength(), offset,
+                    rowBytes, fLastSurfaceWidth, fLastSurfaceHeight, fLastFormat};
                 struct adreno_display_plan plan;
                 error = adreno_display_plan(&source, &d, &plan);
                 if (!error) copy = &source;
@@ -192,6 +200,9 @@ void AdrenoDisplay::presentGated(IOMFBSwapIORequest *swap)
             if (copy) AdrenoEarlyStopPresented(fPresentCount);
         }
     }
+    if (fPresentCount <= 4)
+        IOLog("AdrenoDisplay: present %llu layers %02x fmt %08x %llux%llu row %llu err %d\n", fPresentCount,
+              layers, fLastFormat, fLastSurfaceWidth, fLastSurfaceHeight, fLastSurfaceRowBytes, error);
     if (error) {
         fCopyErrors++;
         if (error != fLastCopyError || fCopyErrors <= 4) {

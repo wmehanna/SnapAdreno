@@ -187,14 +187,26 @@ IOReturn AdrenoDisplay::set_block(task *a0, unsigned int a1, unsigned int a2, un
 IOReturn AdrenoDisplay::get_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3,
                                   unsigned int a4, unsigned char *a5, unsigned long a6) const
 {
-    const IOReturn r = IOMobileFramebufferLegacy::get_block(a0, a1, a2, a3, a4, a5, a6);
+    IOReturn r = adrenoDigitalOutModeBlock(a1, a2, a5, a6);
+    if (r == kIOReturnUnsupported)
+        r = IOMobileFramebufferLegacy::get_block(a0, a1, a2, a3, a4, a5, a6);
     TRACE_CALL(kTraceBlockGet, "get_block(type 0x%x, %u, scalars %u, bytes %lu) = 0x%x", a1, a2, a4, a6, r);
     return r;
 }
 
 IOReturn AdrenoDisplay::get_block_size(task *a0, unsigned int a1, unsigned int *a2)
 {
-    const IOReturn r = IOMobileFramebufferLegacy::get_block_size(a0, a1, a2);
+    IOReturn r = kIOReturnUnsupported;
+    if (a1 == 0x41) {
+        if (!a2)
+            r = kIOReturnBadArgument;
+        else {
+            *a2 = 44;
+            r = kIOReturnSuccess;
+        }
+    } else {
+        r = IOMobileFramebufferLegacy::get_block_size(a0, a1, a2);
+    }
     TRACE_CALL(kTraceBlockSize, "get_block_size(type 0x%x) = 0x%x", a1, r);
     return r;
 }

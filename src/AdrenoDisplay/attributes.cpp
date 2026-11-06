@@ -144,6 +144,18 @@ bool AdrenoDisplay::publishDisplayAttributes()
         setProperty("TimingElements", fTimingElements);
         setProperty("IOMFBMaxSrcPixels", maxSrc);
         setProperty("IOMFBScalingLimits", scaling);
+        // The fixed panel mode is live from the start, the same three properties set_digital_out_mode
+        // publishes when the family selects it: the userland "current digital mode" fetch must answer
+        // 2880x1800 and timing 1000 instead of Core Animation's 16383 sentinel.
+        setProperty("DisplayWidth", kWidth, 32);
+        setProperty("DisplayHeight", kHeight, 32);
+        setProperty("DPTimingModeId", kTimingID, 64);
+        // QuartzCore asks for these on every WindowServer start and got "not found" for each:
+        // the legacy synchronous swap that this driver completes on its frame tick, no Apple
+        // Look colour path, and the panel's 60 Hz rate.
+        setProperty("IOMFBAsyncSwapDisabledKey", true);
+        setProperty("IOMFBSwapAppleLookSupported", false);
+        setProperty("IOMFBDisplayRefresh", 60, 32);
         fAttributesPublished = true;
     } else {
         IOLog("AdrenoDisplay: DisplayAttributes construction failed\n");
@@ -173,6 +185,9 @@ void AdrenoDisplay::withdrawDisplayAttributes()
     removeProperty("TimingElements");
     removeProperty("IOMFBMaxSrcPixels");
     removeProperty("IOMFBScalingLimits");
+    removeProperty("IOMFBAsyncSwapDisabledKey");
+    removeProperty("IOMFBSwapAppleLookSupported");
+    removeProperty("IOMFBDisplayRefresh");
     fDisplayWidth = fDisplayHeight = 0;
     fAttributesPublished = false;
 }

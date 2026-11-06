@@ -19,6 +19,16 @@ bool AdrenoDisplay::start_hardware()
         on[0] = on[1] = on[2] = on[3] = 1;
         fDisplayWidth = kWidth;
         fDisplayHeight = kHeight;
+        // AppleParavirtDisplay's set_digital_out_mode writes the selected geometry into the Legacy
+        // ivars at +0x1bf0/+0x1bf4 (0xa268, 0xa270), which Legacy::get_display_size reads back.
+        // Without them the mode the family reports stays empty and Core Animation calls the display
+        // unready: "current mode (16383 x 16383)", "disables updates", no swap.
+        *(uint32_t *)((uint8_t *)this + 0x1bf0) = kWidth;
+        *(uint32_t *)((uint8_t *)this + 0x1bf4) = kHeight;
+        // Legacy keeps its hotplug state (what get_digital_out_state returns) at +0x1db8, zeroed at
+        // init and written by set_hotPlug_state_gated (0x28b4c). A zero there says the panel is not
+        // attached, which is the other half of Core Animation treating the display as unready.
+        *(uint32_t *)((uint8_t *)this + 0x1db8) = 1;
 #if ADRENO_VSYNC60
         // S5: the grid in abstime, once and in 64 bits, before the timer exists.
         uint64_t period = 0, lead = 0;
@@ -158,6 +168,9 @@ bool AdrenoDisplay::start_hardware()
                   !fRelatchTimer ? "off (no timer)" : relatch ? "on" : "measuring only", pollUs, guardUs);
         }
 #endif
+        // The user-client GetCanvasSizes selector answers kIOReturnBadArgument (0xe00002c2 in the
+        // guest canvas probe, all four words zero) while the display has no canvas; set the panel's.
+        IOMobileFramebufferLegacy::set_canvas_size(kWidth, kHeight);
         if (!publishDisplayAttributes())
             return kIOReturnNoMemory;
         return kIOReturnSuccess;
@@ -241,6 +254,8 @@ IOReturn AdrenoDisplay::set_digital_out_mode(unsigned int colorID, unsigned int 
             return kIOReturnNoMemory;
         fDisplayWidth = kWidth;
         fDisplayHeight = kHeight;
+        *(uint32_t *)((uint8_t *)this + 0x1bf0) = kWidth;    // Legacy::get_display_size reads these two
+        *(uint32_t *)((uint8_t *)this + 0x1bf4) = kHeight;
         forgetDamageGated();         // the first frame after a mode set is written in full
 #if ADRENO_VSYNC60
         adreno_vsync_reset(&fVsync); // S4: and the tick grid restarts
@@ -259,6 +274,16 @@ IOReturn AdrenoDisplay::set_digital_out_mode(unsigned int colorID, unsigned int 
 #endif
         return kIOReturnSuccess;
     });
+}
+
+IOReturn AdrenoDisplay::get_dot_pitch_float(float *pitch)
+{
+    // Legacy returns kIOReturnUnsupported for this slot [295]; report the same pixels-per-inch
+    // as get_dot_pitch, as a float, for clients that ask the float form.
+    if (!pitch)
+        return kIOReturnBadArgument;
+    *pitch = (float)(kWidth * 254 + kPanelWidthMM * 5) / (float)(kPanelWidthMM * 10);
+    return kIOReturnSuccess;
 }
 
 IOReturn AdrenoDisplay::get_dot_pitch(unsigned int *pitch)
@@ -332,3 +357,50 @@ void AdrenoDisplay::unmapScanout()
     OSSafeReleaseNULL(fScanoutMap);
     OSSafeReleaseNULL(fScanoutMD);
 }
+
+// Block type 0x41 is what IOMobileFramebufferGetDigitalOutMode reads: IOMobileFramebuffer's
+// 0x18feff424 dispatches 0x41 with a 44-byte output buffer and, on success, copies the two u32 at
+// +4 and +8 into its colour and timing out-parameters. The family's slot [333] is an inline
+// kIOReturnUnsupported stub, so WindowServer's "fetching current digital mode" fails until the
+// published pair comes back.
+static IOReturn adrenoDigitalOutModeBlock(unsigned int type, unsigned int index, unsigned char *data,
+                                          unsigned long bytes)
+{
+    if (type != 0x41 || index != 0)
+        return kIOReturnUnsupported;
+    if (!data || bytes < 44)
+        return kIOReturnBadArgument;
+    for (unsigned long i = 0; i < 44; i++)
+        data[i] = 0;
+    ((uint32_t *)data)[1] = 100;    // the published colour element (kColorIDSDR8)
+    ((uint32_t *)data)[2] = 1000;   // the one published timing (kTimingID)
+    return kIOReturnSuccess;
+}
+
+#if !ADRENO_DISPLAY_TRACE_MODES
+IOReturn AdrenoDisplay::set_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3,
+                                  unsigned int a4, unsigned char const *a5, unsigned long a6)
+{
+    return IOMobileFramebufferLegacy::set_block(a0, a1, a2, a3, a4, a5, a6);
+}
+
+IOReturn AdrenoDisplay::get_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3,
+                                  unsigned int a4, unsigned char *a5, unsigned long a6) const
+{
+    const IOReturn r = adrenoDigitalOutModeBlock(a1, a2, a5, a6);
+    if (r != kIOReturnUnsupported)
+        return r;
+    return IOMobileFramebufferLegacy::get_block(a0, a1, a2, a3, a4, a5, a6);
+}
+
+IOReturn AdrenoDisplay::get_block_size(task *a0, unsigned int a1, unsigned int *a2)
+{
+    if (a1 == 0x41) {
+        if (!a2)
+            return kIOReturnBadArgument;
+        *a2 = 44;
+        return kIOReturnSuccess;
+    }
+    return IOMobileFramebufferLegacy::get_block_size(a0, a1, a2);
+}
+#endif

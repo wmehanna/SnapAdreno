@@ -15,6 +15,9 @@ void AdrenoDisplay::publishStatsGated()
               putNum(stats, "LastHeight", fLastSurfaceHeight, 64) &&
               putNum(stats, "LastRowBytes", fLastSurfaceRowBytes, 64) &&
               stats->setObject("ConsoleDisabled", fConsoleDisabled ? kOSBooleanTrue : kOSBooleanFalse);
+    ok = ok && putNum(stats, "ScanoutBase", (uint64_t)(uintptr_t)fScanout, 64) &&
+         putNum(stats, "ScanoutPhys", fScanoutPhys, 64) && putNum(stats, "ScanoutBytes", fScanoutLength, 64) &&
+         putNum(stats, "ScanoutRowBytes", fScanoutRowBytes, 64);
     // Cursor layer (docs/ADRENO-DISPLAY-CURSOR-20261018.md). Positions are int32 shown as
     // their 32-bit two's complement (0xfffffffb is -5).
     uint64_t copyNs = 0, copyMaxNs = 0, maintNs = 0;

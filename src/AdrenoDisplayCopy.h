@@ -26,6 +26,12 @@
  *          rounded to 8 bits with integer arithmetic (NaN -> 0), X = 0xff.
  *          The values are taken as already transfer-encoded (INFERRED); a
  *          linear-light surface would look dark, never corrupt memory.
+ *   '&b38' 32bpp, the panel's lossless 30RGBLE plane 0 (Metal's private format
+ *          550): the plug-in treats the plane as one linear image of 64-byte
+ *          aligned rows (AdrenoCompressedSurfaceRow), so it is read the same
+ *          way, with R in bits 0-9, G in 10-19, B in 20-29 as the plug-in's
+ *          WZYX texture mapping writes it, each rounded to 8 bits, X = 0xff.
+ *          Plane 1 (8-bit alpha) is not read: the copy is opaque.
  */
 #ifndef ADRENO_DISPLAY_COPY_H
 #define ADRENO_DISPLAY_COPY_H
@@ -40,6 +46,7 @@ extern "C" {
 #define ADRENO_DISPLAY_FORMAT_BGRA 0x42475241u /* 'BGRA' */
 #define ADRENO_DISPLAY_FORMAT_L10R 0x6c313072u /* 'l10r' */
 #define ADRENO_DISPLAY_FORMAT_RGHA 0x52476841u /* 'RGhA' */
+#define ADRENO_DISPLAY_FORMAT_B38 0x26623338u  /* '&b38' */
 
 enum {
     ADRENO_DISPLAY_OK = 0,
@@ -77,6 +84,7 @@ static inline uint32_t adreno_display_bytes_per_pixel(uint32_t format)
     switch (format) {
     case ADRENO_DISPLAY_FORMAT_BGRA:
     case ADRENO_DISPLAY_FORMAT_L10R:
+    case ADRENO_DISPLAY_FORMAT_B38:
         return 4;
     case ADRENO_DISPLAY_FORMAT_RGHA:
         return 8;
@@ -132,6 +140,18 @@ static inline void adreno_display_convert_row(uint32_t format, const uint8_t *sr
             dst[x * 4 + 0] = adreno_display_unorm10_to_8(v & 0x3ffu);
             dst[x * 4 + 1] = adreno_display_unorm10_to_8((v >> 10) & 0x3ffu);
             dst[x * 4 + 2] = adreno_display_unorm10_to_8((v >> 20) & 0x3ffu);
+            dst[x * 4 + 3] = 0xff;
+        }
+        return;
+    }
+    if (format == ADRENO_DISPLAY_FORMAT_B38) {
+        for (uint64_t x = 0; x < width; x++) {
+            const uint8_t *p = src + x * 4;
+            uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                         ((uint32_t)p[3] << 24);
+            dst[x * 4 + 0] = adreno_display_unorm10_to_8((v >> 20) & 0x3ffu);
+            dst[x * 4 + 1] = adreno_display_unorm10_to_8((v >> 10) & 0x3ffu);
+            dst[x * 4 + 2] = adreno_display_unorm10_to_8(v & 0x3ffu);
             dst[x * 4 + 3] = 0xff;
         }
         return;

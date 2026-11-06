@@ -184,14 +184,48 @@ bool AdrenoDisplay::start(IOService *provider)
     // (updateCursorGated); 2 and 3 are accepted too.
     setProperty("CursorPlane", 1ULL, 32);
     fSwapInfoHead = fSwapInfoTail = 0;
+    const bool started = super::start(provider);
+    // The scanout the present copies into, and the provider the family actually bound to.
+    IOLog("AdrenoDisplay: start %s provider %s scanout %p %llu bytes %ux%u row %u\n",
+          started ? "ok" : "failed", provider ? provider->getMetaClass()->getClassName() : "none",
+          (void *)(uintptr_t)fScanout, fScanoutLength, fScanoutWidth, fScanoutHeight, fScanoutRowBytes);
 #if ADRENO_BACKLIGHT
-    if (!super::start(provider))
+    if (!started)
         return false;
     backlightAttach();   // never fatal: without a service the panel keeps the firmware's brightness
-    return true;
-#else
-    return super::start(provider);
 #endif
+    return started;
+}
+
+void AdrenoDisplay::first_client_open()
+{
+    super::first_client_open();
+    IOLog("AdrenoDisplay: first framebuffer client opened\n");
+}
+
+void AdrenoDisplay::swapping_client_did_start(IOMobileFramebufferUserClient *client)
+{
+    super::swapping_client_did_start(client);
+    IOLog("AdrenoDisplay: swapping client started (%p)\n", client);
+}
+
+IOReturn AdrenoDisplay::add_notification(IOMFB_NotificationType type, IOMFBNotifyRequest *req,
+                                         IOMFBNotifyRequestArgs *args)
+{
+    static uint64_t calls = 0;
+    const IOReturn r = super::add_notification(type, req, args);
+    if (++calls <= 16)
+        IOLog("AdrenoDisplay: add_notification type %u -> %08x\n", (uint32_t)type, r);
+    return r;
+}
+
+IOReturn AdrenoDisplay::powerstate_notify(bool a0, bool a1)
+{
+    static uint64_t calls = 0;
+    const IOReturn r = super::powerstate_notify(a0, a1);
+    if (++calls <= 16)
+        IOLog("AdrenoDisplay: powerstate_notify %d %d -> %08x\n", a0 ? 1 : 0, a1 ? 1 : 0, r);
+    return r;
 }
 
 void AdrenoDisplay::stop(IOService *provider)
@@ -225,14 +259,22 @@ IOReturn AdrenoDisplay::set_notify_tag_mask_gated(IOMFB_NotificationType type, I
                                                   unsigned int mask)
 {
     // PV 0xefb8: only the swap-info notification (type 3) has a tag mask, kept at req+0x78.
+    static uint64_t calls = 0;
+    if (++calls <= 16)
+        IOLog("AdrenoDisplay: set_notify_tag_mask type %u mask %08x\n", (uint32_t)type, mask);
     if ((uint32_t)type != 3)
         return kIOReturnBadArgument;
     *(uint32_t *)((uint8_t *)req + 0x78) = mask;
     return kIOReturnSuccess;
 }
 
-IOReturn AdrenoDisplay::supported_frame_info(unsigned int, unsigned int *, char (*)[64], unsigned int *)
+IOReturn AdrenoDisplay::supported_frame_info(unsigned int index, unsigned int *count, char (*names)[64],
+                                             unsigned int *sizes)
 {
+    static uint64_t calls = 0;
+    if (++calls <= 16)
+        IOLog("AdrenoDisplay: supported_frame_info %u\n", index);
+    (void)count; (void)names; (void)sizes;
     return kIOReturnUnsupported;                                // PV 0xefdc
 }
 

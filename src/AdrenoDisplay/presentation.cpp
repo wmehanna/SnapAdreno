@@ -6,16 +6,25 @@
 
 bool AdrenoDisplay::verify_swap(IOMFBSwapIORequest *)
 {
+    static uint64_t verifies = 0;
+    if (++verifies <= 8)
+        IOLog("AdrenoDisplay: verify_swap #%llu\n", verifies);
     return true;                                                // PV 0x125e0 (the base returns false)
 }
 
-IOReturn AdrenoDisplay::swap_layer_map(IOMFBSwapIORequest *, unsigned int)
+IOReturn AdrenoDisplay::swap_layer_map(IOMFBSwapIORequest *, unsigned int layer)
 {
+    static uint64_t calls = 0;
+    if (++calls <= 16)
+        IOLog("AdrenoDisplay: swap_layer_map layer %u\n", layer);
     return kIOReturnSuccess;                                    // PV 0x126e4
 }
 
-IOReturn AdrenoDisplay::surface_layer_map(IOMFB::AP::DisplayedData *, unsigned int, IOSurface *)
+IOReturn AdrenoDisplay::surface_layer_map(IOMFB::AP::DisplayedData *, unsigned int layer, IOSurface *surface)
 {
+    static uint64_t calls = 0;
+    if (++calls <= 16)
+        IOLog("AdrenoDisplay: surface_layer_map layer %u surface %p\n", layer, surface);
     return kIOReturnSuccess;                                    // PV 0x126f0
 }
 
@@ -47,6 +56,10 @@ bool AdrenoDisplay::cleanQueueGated()
 
 void AdrenoDisplay::swap_begin_gated()
 {
+    static uint64_t begins = 0;
+    if (++begins <= 8)
+        IOLog("AdrenoDisplay: swap_begin #%llu pending %s current %s\n", begins,
+              fPendingSwapFirst ? "yes" : "no", fCurrentSwap ? "yes" : "no");
     // PV swap_begin_gated 0x11aac, with one change: PV cancels and re-arms its timer on every
     // call because the host completes swaps; here the timer *is* the completion, so it is
     // armed once per frame and never pushed back by a stream of submissions.

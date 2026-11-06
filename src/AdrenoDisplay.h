@@ -207,6 +207,14 @@ public:
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void free() APPLE_KEXT_OVERRIDE;
+    // Who opens the framebuffer and who swaps to it: the family logs neither, and both answer whether
+    // WindowServer ever reaches this service (the console carries the lines).
+    virtual void first_client_open() APPLE_KEXT_OVERRIDE;
+    virtual void swapping_client_did_start(IOMobileFramebufferUserClient *client) APPLE_KEXT_OVERRIDE;
+    // Which notifications QuartzCore asks for, and whether the family grants them.
+    virtual IOReturn add_notification(IOMFB_NotificationType type, IOMFBNotifyRequest *req,
+                                      IOMFBNotifyRequestArgs *args) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn powerstate_notify(bool a0, bool a1) APPLE_KEXT_OVERRIDE;
 
     // IOMobileFramebufferLegacy pure virtuals (slots 318 320 361 362 428 429 462 463 470).
     virtual IOReturn set_notify_tag_mask_gated(IOMFB_NotificationType type, IOMFBNotifyRequest *req,
@@ -233,11 +241,20 @@ public:
     // Legacy::get_dot_pitch dereferences the AppleARMIODevice provider cached at +0x1b80
     // without a NULL check; get_dot_pitch_float and get_display_area reach it too.
     virtual IOReturn get_dot_pitch(unsigned int *pitch) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_dot_pitch_float(float *pitch) APPLE_KEXT_OVERRIDE;
     // No DART: layer surfaces are read by the CPU, never mapped for a display engine.
     virtual IOReturn swap_layer_map(IOMFBSwapIORequest *swap, unsigned int layer) APPLE_KEXT_OVERRIDE;
     virtual IOReturn surface_layer_map(IOMFB::AP::DisplayedData *data, unsigned int layer,
                                        IOSurface *surface) APPLE_KEXT_OVERRIDE;
     virtual void surface_layer_unmap(IOMFB::AP::DisplayedData *data, unsigned int layer) APPLE_KEXT_OVERRIDE;
+    // Parameter blocks (slots 332..339): the family's own are inline kIOReturnUnsupported stubs, and
+    // IOMobileFramebufferGetDigitalOutMode reads block type 0x41 (44 bytes) through get_block before
+    // WindowServer can learn the current digital mode. Always declared; trace.cpp logs when tracing.
+    virtual IOReturn set_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3, unsigned int a4,
+                               unsigned char const *a5, unsigned long a6) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3, unsigned int a4,
+                               unsigned char *a5, unsigned long a6) const APPLE_KEXT_OVERRIDE;
+    virtual IOReturn get_block_size(task *a0, unsigned int a1, unsigned int *a2) APPLE_KEXT_OVERRIDE;
 #if ADRENO_DISPLAY_TRACE_MODES
     // The IOMFB call trace (AdrenoDisplay/trace.cpp): each logs and forwards to IOMobileFramebufferLegacy unchanged.
     // Declared exactly as the introducing class declares them (IOMobileGraphicsFamily26A428.h), so each keeps its slot
@@ -260,11 +277,6 @@ public:
     virtual IOReturn setBrightnessCorrection(unsigned int a0) APPLE_KEXT_OVERRIDE;
     virtual IOReturn splc_set_brightness(unsigned int a0) APPLE_KEXT_OVERRIDE;
     virtual IOReturn splc_get_brightness(unsigned int *a0) APPLE_KEXT_OVERRIDE;
-    virtual IOReturn set_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3, unsigned int a4,
-                               unsigned char const *a5, unsigned long a6) APPLE_KEXT_OVERRIDE;
-    virtual IOReturn get_block(task *a0, unsigned int a1, unsigned int a2, unsigned long long const *a3, unsigned int a4,
-                               unsigned char *a5, unsigned long a6) const APPLE_KEXT_OVERRIDE;
-    virtual IOReturn get_block_size(task *a0, unsigned int a1, unsigned int *a2) APPLE_KEXT_OVERRIDE;
     virtual IOReturn swap_set_color_matrix(IOMFBColorFixedMatrix *a0, IOMFBColorMatrixFunction a1,
                                            unsigned int a2) APPLE_KEXT_OVERRIDE;
     virtual IOReturn set_parameter(IOMFBParameterName a0, unsigned long long const *a1, unsigned int a2) APPLE_KEXT_OVERRIDE;
