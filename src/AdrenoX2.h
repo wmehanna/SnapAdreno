@@ -112,6 +112,11 @@ extern "C" uint64_t AdrenoGPUMapBudget(void);   // AdrenoMemoryMap.cpp: the resi
 #ifndef ADRENO_SOFTGPU
 #define ADRENO_SOFTGPU 0
 #endif
+// -DADRENO_SOFTGPU_SELFTEST=1 (SOFTGPU_SELFTEST=1 with PROFILE=softgpu) adds the F1 panel self-test and its boot-args. Off
+// by default: a shipped image has no code that writes through the device into a physical address.
+#ifndef ADRENO_SOFTGPU_SELFTEST
+#define ADRENO_SOFTGPU_SELFTEST 0
+#endif
 #if ADRENO_SOFTGPU
 #include "../../../../compat/softgpu-guest.h"
 extern "C" void AdrenoSoftGPUMapGone(uint32_t id, uint64_t epoch);   // AdrenoX2.cpp: a map gave up its backing
@@ -443,7 +448,9 @@ private:
     void softgpuStop();
     bool softgpuBringUp(bool first);          // spec 1.9; fSubmitLock held
     void softgpuLost(int why);                // RESET_DEVICE and a new epoch; fSubmitLock held
+#if ADRENO_SOFTGPU_SELFTEST
     void softgpuSelfTest();                   // boot-arg softgpu_selftest=1; fSubmitLock held
+#endif
     struct AdrenoSoftGPU *fSoft;
 #endif
     bool prepareStampDMA();

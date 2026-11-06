@@ -332,12 +332,14 @@ void AdrenoAcceleratorX2::softgpuStart(IOService *provider)
     const bool ok = softgpuBringUp(true);
     IOLockUnlock(fSubmitLock);
     if (!ok) { softgpuStop(); return; }
+#if ADRENO_SOFTGPU_SELFTEST
     uint32_t selftest = 0;
     if (PE_parse_boot_argn("softgpu_selftest", &selftest, sizeof selftest) && selftest) {
         IOLockLock(fSubmitLock);
         softgpuSelfTest();
         IOLockUnlock(fSubmitLock);
     }
+#endif
 }
 
 void AdrenoAcceleratorX2::softgpuStop()
@@ -345,38 +347,56 @@ void AdrenoAcceleratorX2::softgpuStop()
     AdrenoSoftGPU *s = fSoft;
     if (!s) return;
     fSoft = nullptr;                                       // streams see INACTIVE from here on
-    if (s->base) { sgWrite(s, SGPU_REG_CONTROL, SGPU_CTL_RESET_DEVICE); IOSleep(1); }   // stop(): no host state left behind
-    // The reset disabled the ring. A device that never confirmed it might still read these pages; the boot is ending.
+    const bool quiet = !s->base || sgResetDevice(s);       // stop(): no host state left behind, once the device says so
     OSSafeReleaseNULL(s->reg);
-    OSSafeReleaseNULL(s->ringMem);
-    OSSafeReleaseNULL(s->statusMem);
-    OSSafeReleaseNULL(s->bootMem);
-    OSSafeReleaseNULL(s->arenaMem);
+    if (quiet) {
+        OSSafeReleaseNULL(s->ringMem);
+        OSSafeReleaseNULL(s->statusMem);
+        OSSafeReleaseNULL(s->bootMem);
+        OSSafeReleaseNULL(s->arenaMem);
+    } else {
+        // A device that never confirmed the reset might still read the ring and write the status page and the arena,
+        // and the guest would reuse those pages: they are leaked on purpose (4 x 16 KiB plus the arena) for this boot.
+        ALOG("SoftGPU: reset unconfirmed at stop; the ring, status, bootstrap and arena pages are kept");
+    }
     IOFree(s, sizeof(AdrenoSoftGPU));
 }
 
+#if ADRENO_SOFTGPU_SELFTEST
 // F1: FILL_BUFFER over a memory object made from the boot console's first 64 rows (the panel). A fill writes one byte
 // everywhere (sgpu_fill_buffer.value is the fill byte), so the rows end up as 0xc0 bytes (softgpu_selftest_byte), not the
-// plan's 0xff3080c0 pixel.
+// plan's 0xff3080c0 pixel. Debug builds only (ADRENO_SOFTGPU_SELFTEST): the device writes through guest physical memory.
 void AdrenoAcceleratorX2::softgpuSelfTest()
 {
     AdrenoSoftGPU *s = fSoft;
-    // The panel is ramfb in guest RAM: its physical base is the run log's "panel 2880x1800x32 (BGR) at ..." line, handed in
-    // as softgpu_selftest_pa (PE_current_console is not a KPI here, and AdrenoDisplay's scanout comes from the family).
-    uint64_t pa = 0, rowBytes = 0;
-    uint32_t row32 = 11520;
+    // The panel is the platform expert's boot console, the framebuffer AdrenoDisplay maps (mapScanout). The target must
+    // lie inside it: softgpu_selftest_pa=<hex> moves the start within the panel, it never leaves it.
+    PE_Video video = {};
+    IOPlatformExpert *pe = getPlatform();
+    if (!pe || pe->getConsoleInfo(&video) != kIOReturnSuccess || !video.v_baseAddr || !video.v_rowBytes || !video.v_height) {
+        ALOG("SoftGPU: self-test: no boot framebuffer in PE_Video");
+        return;
+    }
+    const uint64_t panel = video.v_baseAddr + video.v_offset;
+    if ((panel >> 48) == 0xffff) { ALOG("SoftGPU: self-test: the boot framebuffer is a virtual address"); return; }
+    const uint64_t panelBytes = (uint64_t)video.v_rowBytes * video.v_height;
+    uint64_t pa = panel;
+    uint32_t row32 = (uint32_t)video.v_rowBytes;
     uint32_t fillByte = 0xc0;
     PE_parse_boot_argn("softgpu_selftest_byte", &fillByte, sizeof fillByte);
     PE_parse_boot_argn("softgpu_selftest_row", &row32, sizeof row32);
-    rowBytes = row32;
-    if (!PE_parse_boot_argn("softgpu_selftest_pa", &pa, sizeof pa) || !pa || !rowBytes) {
-        ALOG("SoftGPU: self-test: boot-arg softgpu_selftest_pa=<panel physical address> missing");
+    PE_parse_boot_argn("softgpu_selftest_pa", &pa, sizeof pa);
+    const uint64_t rowBytes = row32;
+    const uint64_t bytes = rowBytes * 64;
+    if (!rowBytes || !sgpu_guest_range_inside(pa, bytes, panel, panelBytes)) {
+        ALOG("SoftGPU: self-test: 0x%llx + 0x%llx is outside the panel 0x%llx + 0x%llx", pa, bytes, panel, panelBytes);
         return;
     }
-    const uint64_t bytes = rowBytes * 64;
     struct sgpu_mem_run run = {pa & ~0xfffull, ((pa & 0xfff) + bytes + 0xfff) & ~0xfffull};
     const uint32_t id = s->nextMem++;
-    int r = sgCreateMemory(s, id, 0, bytes, (uint32_t)(pa & 0xfff), &run, 1);
+    int r = sgFlushPending(s);
+    if (!r) r = sgCreateMemory(s, id, 0, bytes, (uint32_t)(pa & 0xfff), &run, 1);
+    const bool created = !r;
     struct sgpu_guest_bt_in in = {id, ADRENO_USAGE_WRITE, 0, 0, bytes, 0};
     uint64_t off = 0, seq = 0;
     if (!r) r = sgpu_guest_arena_alloc(&s->arena, sizeof(struct sgpu_fill_buffer) + sizeof(struct sgpu_bt_entry), s->ring.next_seqno, &off);
@@ -391,7 +411,14 @@ void AdrenoAcceleratorX2::softgpuSelfTest()
     if (!r) r = sgDrain(s, SG_BUDGET_MS + SG_COMPILE_MS + 3000);
     ALOG("SoftGPU: self-test %s: %llu bytes at 0x%llx filled with 0x%02x (status %d)", r ? "FAILED" : "ok", bytes, pa,
          fillByte & 0xff, r);
+    // The object aliases the panel's pages: destroy it whatever happened (a device that is gone forgot it already).
+    if (created && r != SGPU_E_LOST && r != SGPU_E_TIMEOUT) {
+        const int d = sgKernel(s, sizeof(struct sgpu_destroy_memory), 0, SGPU_GUEST_NO_STAMP, 0,
+                               [&](uint8_t *p) { return sgpu_guest_pkt_destroy_memory(p, sizeof(struct sgpu_destroy_memory), id); });
+        if (d || (r = sgDrain(s, SG_BUDGET_MS))) ALOG("SoftGPU: self-test: DESTROY_MEMORY %u failed %d", id, d ? d : r);
+    }
 }
+#endif
 
 // SOFTGPU_KCMD_STREAM. Entries of the segment list become binding-table entries in list order; their memory objects
 // are created on first use from the map's physical runs. 0, or an SGPU_E_* / ADRENO_* result for submission error 0xa
