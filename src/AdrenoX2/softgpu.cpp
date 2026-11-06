@@ -363,6 +363,7 @@ void AdrenoAcceleratorX2::softgpuStop()
 }
 
 #if ADRENO_SOFTGPU_SELFTEST
+#include <IOKit/IOPlatformExpert.h>
 // F1: FILL_BUFFER over a memory object made from the boot console's first 64 rows (the panel). A fill writes one byte
 // everywhere (sgpu_fill_buffer.value is the fill byte), so the rows end up as 0xc0 bytes (softgpu_selftest_byte), not the
 // plan's 0xff3080c0 pixel. Debug builds only (ADRENO_SOFTGPU_SELFTEST): the device writes through guest physical memory.
