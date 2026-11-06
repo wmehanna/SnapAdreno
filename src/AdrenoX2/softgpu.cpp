@@ -93,7 +93,7 @@ static int sgRetire(AdrenoSoftGPU *s, uint32_t *packetOffset)
 {
     int first = 0;
     struct sgpu_completion c;
-    const struct sgpu_completion *rec = reinterpret_cast<const struct sgpu_completion *>(s->statusVA + 0x1000);
+    const struct sgpu_completion *rec = reinterpret_cast<const struct sgpu_completion *>(const_cast<const uint8_t *>(s->statusVA + 0x1000));
     for (;;) {
         const int r = sgpu_guest_ring_retire_one(&s->ring, rec, sgDone(s), &c);
         if (r < 0) return SGPU_E_LOST;                         // a record that is not the expected one: reset (1.5)
