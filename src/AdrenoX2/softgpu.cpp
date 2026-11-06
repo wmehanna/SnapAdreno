@@ -405,16 +405,18 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
     IOLockLock(fSubmitLock);
     s = fSoft;
     uint32_t packetOffset = 0;
+    bool stale = false;
     if (!result && s && s->on) {
         sgFlushPending(s);
         const uint8_t *stream = nullptr;
         uint32_t sbytes = 0;
         result = sgpu_guest_kcmd_stream(command, bytes, __atomic_load_n(&s->epoch, __ATOMIC_RELAXED), &stream, &sbytes);
+        if (result) stale = true;                           // a stale plug-in epoch is refused (status 5), it never resets
         // memory objects of this epoch for every entry (a stale id with no runs captured means a reset raced us)
         for (uint64_t i = 0; i < count && !result; i++) {
             const uint32_t id = ent[i].map->softgpuId(s->epoch);
             if (id) continue;
-            if (!ent[i].run) { result = SGPU_E_LOST; break; }
+            if (!ent[i].run) { result = SGPU_E_LOST; stale = true; break; }
             const uint32_t nid = s->nextMem++;
             result = sgCreateMemory(s, nid, 0, ent[i].size, ent[i].head, ent[i].run, ent[i].runs);
             if (!result) ent[i].map->softgpuSet(nid, s->epoch);
@@ -450,7 +452,7 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
                 }
             }
         }
-        if (result == SGPU_E_LOST) softgpuLost(result);
+        if (result == SGPU_E_LOST && !stale) softgpuLost(result);   // the device said so: FATAL, or a bad record
     } else if (!result) {
         result = ADRENO_SUBMIT_E_INACTIVE;
     }
