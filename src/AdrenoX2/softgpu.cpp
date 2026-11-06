@@ -21,6 +21,7 @@ struct AdrenoSoftGPU {
     uint32_t cbSerial;
     uint32_t features;
     bool on;
+    bool resetUnconfirmed;      // the last RESET_DEVICE never raised RESET_DONE: the device may still DMA
 };
 // Memory objects whose backing the maps gave up (AdrenoMemoryMap::releaseFromGPUPageTable, free), under the map's lock:
 // they cannot take fSubmitLock there (the IB path takes the map lock under it), so the ids wait here and the next
@@ -76,6 +77,17 @@ static bool sgContiguous(IOBufferMemoryDescriptor *md, uint64_t *pa)
     return *pa && !(*pa & 0x3fff) && seg >= md->getLength();
 }
 
+// RESET_DEVICE and its RESET_DONE. False when the device never confirmed: it may still be reading its ring and writing
+// guest pages, so nothing it was given may be freed or reused.
+static bool sgResetDevice(AdrenoSoftGPU *s)
+{
+    sgWrite(s, SGPU_REG_IRQ_STATUS, 0xffffffffu);
+    sgWrite(s, SGPU_REG_CONTROL, SGPU_CTL_RESET_DEVICE);
+    if (!sgPoll(SG_BUDGET_MS, [&] { return (sgRead(s, SGPU_REG_IRQ_RAW) & SGPU_IRQ_RESET_DONE) != 0; })) return false;
+    sgWrite(s, SGPU_REG_IRQ_STATUS, SGPU_IRQ_RESET_DONE);
+    return true;
+}
+
 // Push one descriptor and ring RING_TAIL. 0, or SGPU_GUEST_BUSY. Caller holds fSubmitLock.
 static int sgPush(AdrenoSoftGPU *s, const struct sgpu_desc *d, uint64_t *seqno)
 {
@@ -96,7 +108,8 @@ static int sgRetire(AdrenoSoftGPU *s, uint32_t *packetOffset)
         const int r = sgpu_guest_ring_retire_one(&s->ring, rec, sgDone(s), &c);
         if (r < 0) return SGPU_E_LOST;                         // a record that is not the expected one: reset (1.5)
         if (!r) break;
-        if (c.status && !first) { first = c.status; if (packetOffset) *packetOffset = c.packet_offset; }
+        const int32_t status = sgpu_guest_device_status(c.status);       // the device is not trusted to stay in range
+        if (status && !first) { first = status; if (packetOffset) *packetOffset = c.packet_offset; }
     }
     sgpu_guest_arena_release(&s->arena, s->ring.done_seqno);
     return first;
@@ -141,13 +154,14 @@ static int sgDrain(AdrenoSoftGPU *s, uint32_t ms)
     return last > s->ring.done_seqno ? sgWaitDone(s, last, ms, nullptr) : sgRetire(s, nullptr);
 }
 
-// Send DESTROY_MEMORY for the maps that gave up their backing. Under fSubmitLock.
-static void sgFlushPending(AdrenoSoftGPU *s)
+// Send DESTROY_MEMORY for the maps that gave up their backing and wait for them. Under fSubmitLock. These descriptors
+// belong to no stream: a refusal is logged and dropped, only a lost device (SGPU_E_LOST) is the caller's.
+static int sgFlushPending(AdrenoSoftGPU *s)
 {
     uint32_t ids[64];
     uint32_t n = 0;
     IOSimpleLock *lock = __atomic_load_n(&gSoftPendLock, __ATOMIC_ACQUIRE);
-    if (!lock) return;
+    if (!lock) return 0;
     for (;;) {
         n = 0;
         IOSimpleLockLock(lock);
@@ -157,20 +171,28 @@ static void sgFlushPending(AdrenoSoftGPU *s)
         }
         const bool more = gSoftPendCount != 0;
         IOSimpleLockUnlock(lock);
-        for (uint32_t i = 0; i < n; i++)
-            sgKernel(s, sizeof(struct sgpu_destroy_memory), 0, SGPU_GUEST_NO_STAMP, 0,
-                     [&](uint8_t *p) { return sgpu_guest_pkt_destroy_memory(p, sizeof(struct sgpu_destroy_memory), ids[i]); });
-        if (!more) return;
+        if (n) {
+            int r = 0;
+            for (uint32_t i = 0; i < n && !r; i++)
+                r = sgKernel(s, sizeof(struct sgpu_destroy_memory), 0, SGPU_GUEST_NO_STAMP, 0,
+                             [&](uint8_t *p) { return sgpu_guest_pkt_destroy_memory(p, sizeof(struct sgpu_destroy_memory), ids[i]); });
+            if (!r) r = sgDrain(s, SG_BUDGET_MS);
+            if (r) ALOG("SoftGPU: DESTROY_MEMORY of %u objects failed %d", n, r);
+            if ((r = sgpu_guest_housekeeping_result(r))) return r;
+        }
+        if (!more) return 0;
     }
 }
 
-// CREATE_MEMORY for a map's runs; the id is recorded by the caller. Under fSubmitLock.
+// CREATE_MEMORY for a map's runs, completed before it returns: the caller records the id only on 0. The queue holds
+// nothing else here (sgFlushPending drained it), so a failing status is this object's. Under fSubmitLock.
 static int sgCreateMemory(AdrenoSoftGPU *s, uint32_t id, uint32_t flags, uint64_t size, uint32_t head,
                           const struct sgpu_mem_run *runs, uint32_t nruns)
 {
     const uint32_t bytes = (uint32_t)(sizeof(struct sgpu_create_memory) + (uint64_t)nruns * sizeof *runs);
-    return sgKernel(s, bytes, 0, SGPU_GUEST_NO_STAMP, 0, [&](uint8_t *p) {
+    int r = sgKernel(s, bytes, 0, SGPU_GUEST_NO_STAMP, 0, [&](uint8_t *p) {
         return sgpu_guest_pkt_create_memory(p, bytes, id, flags, size, 0, head, runs, nruns); });
+    return r ? r : sgDrain(s, SG_BUDGET_MS);
 }
 
 // Spec 1.9 steps 1 to 6 on a device in any state. Allocations are made once (first); a reset reruns the rest.
@@ -183,13 +205,11 @@ bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
         ALOG("SoftGPU: bad magic 0x%x or version 0x%x", sgRead(s, SGPU_REG_MAGIC), sgRead(s, SGPU_REG_VERSION));
         return false;
     }
-    sgWrite(s, SGPU_REG_IRQ_STATUS, 0xffffffffu);
-    sgWrite(s, SGPU_REG_CONTROL, SGPU_CTL_RESET_DEVICE);
-    if (!sgPoll(SG_BUDGET_MS, [&] { return (sgRead(s, SGPU_REG_IRQ_RAW) & SGPU_IRQ_RESET_DONE) != 0; })) {
+    s->resetUnconfirmed = !sgResetDevice(s);
+    if (s->resetUnconfirmed) {
         ALOG("SoftGPU: RESET_DEVICE did not finish");
         return false;
     }
-    sgWrite(s, SGPU_REG_IRQ_STATUS, SGPU_IRQ_RESET_DONE);
     // 2: negotiate (the core feature only in this wave), the protocol version
     s->features = sgRead(s, SGPU_REG_FEATURES0) & SGPU_F_CORE;
     sgWrite(s, SGPU_REG_DRV_FEATURES0, s->features);
@@ -376,50 +396,76 @@ void AdrenoAcceleratorX2::softgpuSelfTest()
 // SOFTGPU_KCMD_STREAM. Entries of the segment list become binding-table entries in list order; their memory objects
 // are created on first use from the map's physical runs. 0, or an SGPU_E_* / ADRENO_* result for submission error 0xa
 // (the queue maps SGPU_E_* through sgpu_guest_iogpu_status).
+// TODO(W5, softgpu/SOFTGPU-PROTOCOL.md review item M7): fSubmitLock is held while this sleeps in the completion polls, up
+// to SG_BUDGET_MS + SG_COMPILE_MS + 3 s (about 25 s) for a stream. W5 moves completion to the IRQ on its own workloop so
+// the lock is dropped across the wait; until then every other submitter and the IB path queue behind a slow compile.
 int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *command, uint64_t bytes)
 {
     if (!list || !command) return ADRENO_LIST_E_ARGUMENT;
     AdrenoSoftGPU *s = fSoft;
     if (!s || !fSubmitLock) return ADRENO_SUBMIT_E_INACTIVE;
     // Before the lock (map locks are taken inside the IB path under fSubmitLock, never the other way round): the runs
-    // of every entry whose memory object is missing or from an older epoch.
+    // of every entry whose memory object is missing or from an older epoch. They go into one pool that grows with what
+    // the maps really have (a map has few runs, not one per page), once per distinct map, up to
+    // SGPU_GUEST_POOL_MAX_RUNS for the whole stream; a list needing more is refused.
     const uint64_t count = list->entryCount();
     if (count > SGPU_MAX_BT_COUNT) return SGPU_E_FORMAT;
-    struct Ent { AdrenoMemoryMap *map; uint32_t usage, resourceId, cap, runs, head; struct sgpu_mem_run *run; uint64_t size; };
+    struct Ent { AdrenoMemoryMap *map; uint32_t usage, resourceId, runOff, runs, head; uint64_t size; };
     const size_t entBytes = (size_t)count * sizeof(Ent) + 1;
     Ent *ent = static_cast<Ent *>(IOMalloc(entBytes));
     if (!ent) return SGPU_E_HOST;
     bzero(ent, entBytes);
+    struct sgpu_mem_run *pool = nullptr;
+    uint32_t poolCap = 0, poolUsed = 0;
+    uint64_t *distinct = nullptr;
+    const uint32_t distinctSlots = sgpu_guest_set_slots((uint32_t)count);
     int result = 0;
     const uint64_t seen = __atomic_load_n(&s->epoch, __ATOMIC_ACQUIRE);
     for (uint64_t i = 0; i < count && !result; i++) {
         if (!list->entryAt(i, &ent[i].map, &ent[i].usage, &ent[i].resourceId) || !ent[i].map) { result = SGPU_E_OBJECT; break; }
         if (ent[i].map->softgpuId(seen)) continue;
-        uint32_t cap = (uint32_t)(ent[i].map->softgpuSpan() / 0x1000 + 1);   // one run per page at worst
-        if (cap > SGPU_GUEST_MAX_RUNS) cap = SGPU_GUEST_MAX_RUNS;
-        ent[i].run = static_cast<struct sgpu_mem_run *>(IOMalloc((size_t)cap * sizeof(struct sgpu_mem_run)));
-        if (!ent[i].run) { result = SGPU_E_HOST; break; }
-        ent[i].cap = cap;
-        result = ent[i].map->softgpuRuns(ent[i].run, cap, &ent[i].runs, &ent[i].head, &ent[i].size);
+        if (!distinct) {
+            distinct = static_cast<uint64_t *>(IOMalloc((size_t)distinctSlots * sizeof *distinct));
+            if (!distinct) { result = SGPU_E_HOST; break; }
+            bzero(distinct, (size_t)distinctSlots * sizeof *distinct);
+        }
+        const int added = sgpu_guest_set_add(distinct, distinctSlots, (uint64_t)(uintptr_t)ent[i].map);
+        if (added <= 0) { result = added; continue; }       // 0: the same map again, its runs are already in the pool
+        for (;;) {
+            result = ent[i].map->softgpuRuns(pool + poolUsed, poolCap - poolUsed, &ent[i].runs, &ent[i].head, &ent[i].size);
+            if (result != SGPU_E_BOUNDS) break;
+            const uint32_t grown = sgpu_guest_pool_grow(poolCap);
+            if (!grown) { result = SGPU_E_QUOTA; break; }
+            struct sgpu_mem_run *bigger = static_cast<struct sgpu_mem_run *>(IOMalloc((size_t)grown * sizeof *bigger));
+            if (!bigger) { result = SGPU_E_HOST; break; }
+            if (pool) { memcpy(bigger, pool, (size_t)poolUsed * sizeof *bigger); IOFree(pool, (size_t)poolCap * sizeof *pool); }
+            pool = bigger;
+            poolCap = grown;
+        }
+        ent[i].runOff = poolUsed;
+        if (!result) poolUsed += ent[i].runs;
     }
+    if (distinct) IOFree(distinct, (size_t)distinctSlots * sizeof *distinct);
     IOLockLock(fSubmitLock);
     s = fSoft;
     uint32_t packetOffset = 0;
-    bool stale = false;
+    bool stale = false, wedged = false;
     if (!result && s && s->on) {
-        sgFlushPending(s);
+        result = sgFlushPending(s);                         // DESTROYs of dead objects: only a lost device is this stream's
         const uint8_t *stream = nullptr;
         uint32_t sbytes = 0;
-        result = sgpu_guest_kcmd_stream(command, bytes, __atomic_load_n(&s->epoch, __ATOMIC_RELAXED), &stream, &sbytes);
-        if (result) stale = true;                           // a stale plug-in epoch is refused (status 5), it never resets
+        if (!result) {
+            result = sgpu_guest_kcmd_stream(command, bytes, __atomic_load_n(&s->epoch, __ATOMIC_RELAXED), &stream, &sbytes);
+            if (result) stale = true;                       // a stale plug-in epoch is refused (status 5), it never resets
+        }
         // memory objects of this epoch for every entry (a stale id with no runs captured means a reset raced us)
         for (uint64_t i = 0; i < count && !result; i++) {
             const uint32_t id = ent[i].map->softgpuId(s->epoch);
             if (id) continue;
-            if (!ent[i].run) { result = SGPU_E_LOST; stale = true; break; }
+            if (!ent[i].runs) { result = SGPU_E_LOST; stale = true; break; }
             const uint32_t nid = s->nextMem++;
-            result = sgCreateMemory(s, nid, 0, ent[i].size, ent[i].head, ent[i].run, ent[i].runs);
-            if (!result) ent[i].map->softgpuSet(nid, s->epoch);
+            result = sgCreateMemory(s, nid, 0, ent[i].size, ent[i].head, pool + ent[i].runOff, ent[i].runs);
+            if (!result) ent[i].map->softgpuSet(nid, s->epoch);   // only an object the device accepted
         }
         if (!result) {
             const uint64_t total = (uint64_t)sbytes + 32ull * count;
@@ -427,7 +473,6 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
             result = sgpu_guest_arena_alloc(&s->arena, total, s->ring.next_seqno, &off);
             if (result == SGPU_GUEST_BUSY && !(result = sgDrain(s, SG_BUDGET_MS)))
                 result = sgpu_guest_arena_alloc(&s->arena, total, s->ring.next_seqno, &off);
-            if (result == SGPU_GUEST_BUSY) result = SGPU_E_QUOTA;
             if (!result) {
                 memcpy(s->arenaVA + off, stream, sbytes);
                 struct sgpu_bt_entry *bt = reinterpret_cast<struct sgpu_bt_entry *>(s->arenaVA + off + sbytes);
@@ -440,6 +485,7 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
                 sgpu_guest_desc_submit(&d, 1, ++s->cbSerial, SGPU_DESC_LAST, off, sbytes, off + sbytes, (uint32_t)count,
                                        SGPU_GUEST_NO_STAMP, 0, 0, (uint64_t)(uintptr_t)list);
                 result = sgPush(s, &d, &seq);
+                if (result == SGPU_GUEST_BUSY && !(result = sgDrain(s, SG_BUDGET_MS))) result = sgPush(s, &d, &seq);
                 // renderd's watchdog bound (1.11)
                 if (!result) result = sgWaitDone(s, seq, SG_BUDGET_MS + SG_COMPILE_MS + 3000, &packetOffset);
                 if (result == SGPU_E_TIMEOUT) {                 // still running: abort it and take the queue back
@@ -447,20 +493,28 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
                     if (sgPoll(SG_BUDGET_MS, [&] { return (sgRead(s, SGPU_REG_IRQ_RAW) & SGPU_IRQ_RESET_DONE) != 0; })) {
                         sgWrite(s, SGPU_REG_IRQ_STATUS, SGPU_IRQ_RESET_DONE);
                         sgRetire(s, nullptr);
-                    } else
-                        result = SGPU_E_LOST;
+                    } else {
+                        // Unconfirmed: the device may still be running this stream against the list's pages. Not
+                        // "lost": IOGPU would unprepare (unpin) them. UNCERTAIN keeps the pins; the device is reset
+                        // below, and if that is unconfirmed too the transport stays off.
+                        result = ADRENO_SUBMIT_E_UNCERTAIN;
+                        wedged = true;
+                    }
                 }
             }
         }
-        if (result == SGPU_E_LOST && !stale) softgpuLost(result);   // the device said so: FATAL, or a bad record
+        if (wedged || (result == SGPU_E_LOST && !stale)) {      // the device said so: FATAL, or a bad record
+            softgpuLost(result);
+            result = sgpu_guest_reset_result(result, !s->resetUnconfirmed);
+        }
     } else if (!result) {
         result = ADRENO_SUBMIT_E_INACTIVE;
     }
     IOLockUnlock(fSubmitLock);
+    result = sgpu_guest_public_result(result);                  // SGPU_GUEST_BUSY / _E_RECORD are host-only codes
     if (result && result != ADRENO_SUBMIT_E_INACTIVE)
         ALOG("SoftGPU: stream refused %d at packet 0x%x", result, packetOffset);
-    for (uint64_t i = 0; i < count; i++)
-        if (ent[i].run) IOFree(ent[i].run, (size_t)ent[i].cap * sizeof(struct sgpu_mem_run));
+    if (pool) IOFree(pool, (size_t)poolCap * sizeof *pool);
     IOFree(ent, entBytes);
     return result;
 }
