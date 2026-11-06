@@ -184,15 +184,10 @@ public:
     int resolveRange(uint64_t offset, uint64_t bytes, uint64_t *address);   // IB relocations (design 3.2)
 #if ADRENO_SOFTGPU
     // The SoftGPU memory object of this map (AdrenoX2/softgpu.cpp): its id when it belongs to `epoch`, else 0.
-    uint32_t softgpuId(uint64_t epoch) const
-    {
-        return __atomic_load_n(&fSoftGPUEpoch, __ATOMIC_ACQUIRE) == epoch ? __atomic_load_n(&fSoftGPUId, __ATOMIC_ACQUIRE) : 0;
-    }
-    void softgpuSet(uint32_t id, uint64_t epoch)
-    {
-        __atomic_store_n(&fSoftGPUEpoch, epoch, __ATOMIC_RELEASE);
-        __atomic_store_n(&fSoftGPUId, id, __ATOMIC_RELEASE);
-    }
+    uint32_t softgpuId(uint64_t epoch) const { return sgpu_guest_obj_get(&fSoftGPU, epoch); }
+    void softgpuSet(uint32_t id, uint64_t epoch) { sgpu_guest_obj_set(&fSoftGPU, id, epoch); }
+    // The pages are no longer pinned (or never will be again): hand the id to the host for DESTROY_MEMORY. Under the lock.
+    void softgpuRetire();
     uint64_t softgpuSpan() const { return fResource.logical_length; }          // map extent, an upper bound for the runs
     uint64_t softgpuLogicalBytes() const;                                     // the extent past the head
     uint32_t softgpuReadOnly() const { return fBackingDirection == kIODirectionOut; }
@@ -260,8 +255,8 @@ private:
     uint32_t fRefusalReported;     // reportRefused has logged this map
 #endif
 #if ADRENO_SOFTGPU
-    uint64_t fSoftGPUEpoch;        // the device epoch fSoftGPUId belongs to (a reset forgets every id by this tag)
-    uint32_t fSoftGPUId;           // memory object id, 0 none; sent as DESTROY_MEMORY when the backing is unpinned
+    struct sgpu_guest_obj fSoftGPU;   // memory object id and the device epoch it belongs to (a reset forgets every id by
+                                      // that tag); retired (DESTROY_MEMORY queued) by unpinBacking, whenever the pages go
 #endif
 #if ADRENO_RESIDENT_HEAD_OFFSET
     // The head rule (adreno-resource-tail.h): called by pinBacking after the wire, under the lock; on refusal it has

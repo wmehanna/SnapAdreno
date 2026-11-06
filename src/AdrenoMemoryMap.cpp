@@ -515,6 +515,11 @@ int AdrenoMemoryMap::resolveRange(uint64_t offset, uint64_t bytes, uint64_t *add
 }
 
 #if ADRENO_SOFTGPU
+void AdrenoMemoryMap::softgpuRetire()
+{
+    uint64_t epoch = 0;
+    if (const uint32_t id = sgpu_guest_obj_take(&fSoftGPU, &epoch)) AdrenoSoftGPUMapGone(id, epoch);
+}
 uint64_t AdrenoMemoryMap::softgpuLogicalBytes() const
 {
     uint64_t head=0;
@@ -684,6 +689,12 @@ int AdrenoMemoryMap::unpinBacking(void *ctx)
     map->fLastNativeStatus = static_cast<uint32_t>(result);
     if (result != kIOReturnSuccess) return result; // retain on uncertain completion
     OSSafeReleaseNULL(map->fBacking);
+#if ADRENO_SOFTGPU
+    // The only place a pinned backing is given up (unwire, rewire onto another descriptor, retire, free, a failed
+    // commit): the host must drop its alias before the guest reuses the pages (DESTROY sent later, spec 2.6). A kept
+    // pin (resident, a failed complete above) keeps the object.
+    map->softgpuRetire();
+#endif
 #if ADRENO_RESIDENT_REPIN
     map->fBackingBytes = 0;
 #endif
@@ -950,11 +961,7 @@ void AdrenoMemoryMap::releaseFromGPUPageTable()
 #endif
     if (error) MLOG("clear/unpin failed %d native=0x%llx; retaining resource", error, fLastNativeStatus);
 #if ADRENO_SOFTGPU
-    // The pages are no longer pinned: the host must drop its alias before the guest reuses them (sent later, 2.6).
-    if (fSoftGPUId && !(fResource.flags&ADRENO_RESOURCE_PINNED)) {
-        AdrenoSoftGPUMapGone(fSoftGPUId,fSoftGPUEpoch);
-        fSoftGPUId=0;
-    }
+    // The memory object is retired by unpinBacking, wherever the pages are unpinned.
 #endif
     if (__atomic_load_n(&gResidency.refused, __ATOMIC_RELAXED) &&
         !__atomic_exchange_n(&gResidencyFullLogged, 1, __ATOMIC_RELAXED))
@@ -1005,9 +1012,6 @@ void AdrenoMemoryMap::free()
     if (fLock) {
         IORecursiveLockLock(fLock);
         bool released = releaseAddress();
-#if ADRENO_SOFTGPU
-        if (released && fSoftGPUId) { AdrenoSoftGPUMapGone(fSoftGPUId,fSoftGPUEpoch); fSoftGPUId=0; }
-#endif
         IORecursiveLockUnlock(fLock);
         if (!released) return; // keep native task/memory refs and backing until reboot
         IORecursiveLockFree(fLock); fLock = nullptr;
