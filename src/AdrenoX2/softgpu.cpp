@@ -528,8 +528,8 @@ void AdrenoAcceleratorX2::softgpuW5Check()
         if (d || sgDrain(s, SG_BUDGET_MS)) ALOG("SoftGPU: W5 check: DESTROY_MEMORY %u failed", id);
     };
     // FILL_BUFFER of `bytes` with `value` over object `id`, bound WRITE. The stream's status.
-    auto fill = [&](uint32_t id, uint64_t bytes, uint32_t value) {
-        struct sgpu_guest_bt_in in = {id, ADRENO_USAGE_WRITE, 0, 0, bytes, 0};
+    auto fill = [&](uint32_t id, uint64_t bytes, uint32_t value, uint64_t at = 0) {
+        struct sgpu_guest_bt_in in = {id, ADRENO_USAGE_WRITE, 0, at, bytes, 0};
         uint64_t off = 0, seq = 0;
         int r = sgpu_guest_arena_alloc(&s->arena, sizeof(struct sgpu_fill_buffer) + sizeof(struct sgpu_bt_entry), s->ring.next_seqno, &off);
         if (r) return r;
@@ -556,21 +556,27 @@ void AdrenoAcceleratorX2::softgpuW5Check()
     if (trust) {
         const uint32_t id = s->nextMem++;
         struct sgpu_mem_run run = {trust & ~0x3fffull, 0x4000};
-        uint8_t keep = 0;
+        // A fill writes ONE byte value everywhere, so the write is aimed at four bytes that already hold the same value.
+        uint8_t head[256] = {};
+        int at = -1;
         IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(run.gpa, 0x4000, kIODirectionIn);
-        if (md && md->prepare() == kIOReturnSuccess) { md->readBytes(0, &keep, 1); md->complete(); }
+        if (md && md->prepare() == kIOReturnSuccess) { md->readBytes(0, head, sizeof head); md->complete(); }
         OSSafeReleaseNULL(md);
+        for (int i = 0; i + 4 <= (int)sizeof head && at < 0; i += 4)
+            if (head[i] == head[i + 1] && head[i] == head[i + 2] && head[i] == head[i + 3]) at = i;
         int r = sgCreateMemory(s, id, 0, 0x4000, 0, &run, 1);
         ALOG("SoftGPU: W5 trust cache 0x%llx: CREATE_MEMORY (read) status %d, want 0: %s", run.gpa, r, r ? "FAILED" : "ok");
         pass &= !r;
-        if (!r) {
-            r = fill(id, 1, keep);
+        const bool made = !r;
+        if (!r && at < 0) { ALOG("SoftGPU: W5 trust cache: no four equal bytes in the first 256 to aim the write at"); pass = false; }
+        if (!r && at >= 0) {
+            r = fill(id, 4, head[at], (uint64_t)at);
             const bool ok = r == SGPU_E_ACCESS || r == SGPU_E_MEMORY;
             ALOG("SoftGPU: W5 trust cache WRITE binding: status %d, want %d (SGPU_E_ACCESS) or %d (SGPU_E_MEMORY, the device's code for a window without WRITE): %s",
                  r, SGPU_E_ACCESS, SGPU_E_MEMORY, ok ? "ok" : "FAILED");
             pass &= ok;
-            destroy(id);
         }
+        if (made) destroy(id);
     }
     // 3. control: ordinary kernel memory takes the same write, so the refusals above are the windows' doing
     {
