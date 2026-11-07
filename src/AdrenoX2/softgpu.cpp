@@ -571,9 +571,9 @@ void AdrenoAcceleratorX2::softgpuW5Check()
         if (!r && at < 0) { ALOG("SoftGPU: W5 trust cache: no four equal bytes in the first 256 to aim the write at"); pass = false; }
         if (!r && at >= 0) {
             r = fill(id, 4, head[at], (uint64_t)at);
-            const bool ok = r == SGPU_E_ACCESS || r == SGPU_E_MEMORY;
-            ALOG("SoftGPU: W5 trust cache WRITE binding: status %d, want %d (SGPU_E_ACCESS) or %d (SGPU_E_MEMORY, the device's code for a window without WRITE): %s",
-                 r, SGPU_E_ACCESS, SGPU_E_MEMORY, ok ? "ok" : "FAILED");
+            const bool ok = r == SGPU_E_ACCESS;                       // READ is kept, WRITE refused: exactly ACCESS (spec 1.3)
+            ALOG("SoftGPU: W5 trust cache WRITE binding: status %d, want %d (SGPU_E_ACCESS): %s",
+                 r, SGPU_E_ACCESS, ok ? "ok" : "FAILED");
             pass &= ok;
         }
         if (made) destroy(id);
