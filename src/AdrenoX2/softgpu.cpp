@@ -596,6 +596,8 @@ void AdrenoAcceleratorX2::softgpuW5Check()
         }
         OSSafeReleaseNULL(md);
     }
+    ALOG("SoftGPU: completion irqs %llu, waits ended by the interrupt %llu, by the poll %llu, empty slices %llu (interrupt %s)",
+         __atomic_load_n(&s->irqCount, __ATOMIC_RELAXED), s->irqWakes, s->pollWakes, s->pollTimeouts, s->irq ? "armed" : "absent");
     ALOG("SoftGPU: W5 check %s (windows, lock and refusals)", pass ? "PASSED" : "FAILED");
     setProperty("SoftGPUW5", pass ? 1ULL : 0ULL, 32);
 }
