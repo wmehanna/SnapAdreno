@@ -22,6 +22,16 @@ struct AdrenoSoftGPU {
     uint32_t features;
     bool on;
     bool resetUnconfirmed;      // the last RESET_DEVICE never raised RESET_DONE: the device may still DMA
+    // W5: the DONE interrupt. The handler runs on its own workloop with neither fSubmitLock nor the map locks.
+    IOWorkLoop *loop;
+    IOInterruptEventSource *irq;
+    IOLock *wake;               // guards the sleep/wakeup pair on irqSeq
+    volatile uint32_t irqSeq;   // bumped by the handler under `wake`
+    bool irqOn;                 // the source is attached and enabled and the device's mask is set (re-set after a reset)
+    uint64_t irqCount;          // handler runs that acked a cause (atomic)
+    uint64_t irqWakes;          // waits ended by the interrupt
+    uint64_t pollWakes;         // waits ended by the slice timeout with the work already done: the poll fallback at work
+    uint64_t pollTimeouts;      // slices that ended with nothing done
 };
 // Memory objects whose backing the maps gave up (AdrenoMemoryMap::releaseFromGPUPageTable, free), under the map's lock:
 // they cannot take fSubmitLock there (the IB path takes the map lock under it), so the ids wait here and the next
@@ -44,6 +54,8 @@ extern "C" void AdrenoSoftGPUMapGone(uint32_t id, uint64_t epoch)
     IOSimpleLockUnlock(lock);
 }
 
+#define SG_IRQ_CAUSES (SGPU_IRQ_DONE | SGPU_IRQ_FAULT | SGPU_IRQ_FATAL)   // RESET_DONE stays masked: sgResetDevice polls RAW
+#define SG_IRQ_SLICE_MS 5u        // longest sleep without a re-check of the status page
 #define SG_BUDGET_MS 2000u
 #define SG_COMPILE_MS 20000u      // COMPILE_BUDGET_MS register default; W4 measures before this moves
 static inline uint32_t sgRead(AdrenoSoftGPU *s, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(s->base + off); }
@@ -60,13 +72,33 @@ static uint64_t sgNow()
     absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
     return ns;
 }
-// Poll `done()` until it holds or `ms` pass: a short busy wait first (a fill is microseconds), then 1 ms sleeps.
-template <typename F> static bool sgPoll(uint32_t ms, F done)
+// Sleep up to SG_IRQ_SLICE_MS on the device interrupt. `done` is re-checked under the lock the handler takes before it wakes
+// us, so an interrupt that arrives between the check and the sleep is not lost.
+template <typename F> static void sgIrqSleep(AdrenoSoftGPU *s, F done)
+{
+    uint64_t deadline = 0;
+    IOLockLock(s->wake);
+    if (!done()) {
+        uint64_t slice = 0;
+        nanoseconds_to_absolutetime((uint64_t)SG_IRQ_SLICE_MS * 1000000ull, &slice);
+        deadline = mach_absolute_time() + slice;
+        const wait_result_t w = IOLockSleepDeadline(s->wake, (void *)&s->irqSeq, deadline, THREAD_UNINT);
+        if (w == THREAD_AWAKENED) s->irqWakes++;
+        else if (done()) s->pollWakes++;                   // the interrupt never came but the work is done: the poll caught it
+        else s->pollTimeouts++;
+    }
+    IOLockUnlock(s->wake);
+}
+// Poll `done()` until it holds or `ms` pass: a short busy wait first (a fill is microseconds), then 1 ms sleeps, or, with
+// `s` given and its interrupt armed, sleeps on the interrupt in slices.
+template <typename F> static bool sgPoll(uint32_t ms, F done, AdrenoSoftGPU *s = nullptr)
 {
     const uint64_t limit = sgNow() + (uint64_t)ms * 1000000ull;
     for (unsigned spin = 0; !done(); spin++) {
         if (sgNow() > limit) return false;
-        if (spin < 200) IODelay(10); else IOSleep(1);
+        if (spin < 200) IODelay(10);
+        else if (s && s->irqOn) sgIrqSleep(s, done);
+        else IOSleep(1);
     }
     return true;
 }
@@ -91,7 +123,9 @@ static bool sgResetDevice(AdrenoSoftGPU *s)
 // Push one descriptor and ring RING_TAIL. 0, or SGPU_GUEST_BUSY. Caller holds fSubmitLock.
 static int sgPush(AdrenoSoftGPU *s, const struct sgpu_desc *d, uint64_t *seqno)
 {
-    const uint64_t n = sgpu_guest_ring_push(&s->ring, d);
+    struct sgpu_desc withIrq = *d;
+    if (s->irqOn) withIrq.flags |= SGPU_DESC_IRQ;          // the DONE cause is what the wait sleeps on
+    const uint64_t n = sgpu_guest_ring_push(&s->ring, &withIrq);
     if (!n) return SGPU_GUEST_BUSY;
     __asm__ volatile("dsb st" ::: "memory");
     sgWrite(s, SGPU_REG_RING_TAIL, s->ring.produced);
@@ -122,7 +156,7 @@ static int sgWaitDone(AdrenoSoftGPU *s, uint64_t seqno, uint32_t ms, uint32_t *p
         if (sgDone(s) >= seqno) return true;
         if (sgRead(s, SGPU_REG_STATUS) & SGPU_ST_FATAL) { fatal = true; return true; }
         return false;
-    });
+    }, s);
     if (fatal) return SGPU_E_LOST;
     if (!ok) return SGPU_E_TIMEOUT;
     return sgRetire(s, packetOffset);
@@ -200,6 +234,7 @@ bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
 {
     AdrenoSoftGPU *s = fSoft;
     s->on = false;
+    s->irqOn = false;           // until RING_ENABLE: bring-up waits poll
     // 1: MAGIC, VERSION major 1, RESET_DEVICE and its RESET_DONE
     if (sgRead(s, SGPU_REG_MAGIC) != SGPU_MAGIC || (sgRead(s, SGPU_REG_VERSION) >> 16) != 1) {
         ALOG("SoftGPU: bad magic 0x%x or version 0x%x", sgRead(s, SGPU_REG_MAGIC), sgRead(s, SGPU_REG_VERSION));
@@ -215,7 +250,7 @@ bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
     sgWrite(s, SGPU_REG_DRV_FEATURES0, s->features);
     sgWrite(s, SGPU_REG_DRV_FEATURES1, 0);
     sgWrite(s, SGPU_REG_DRV_VERSION, SGPU_VERSION);
-    // 3: wired contiguous 16 KiB pages, the registers (the IRQ mask stays 0: polled until W5 routes INTID 144)
+    // 3: wired contiguous 16 KiB pages, the registers
     uint64_t ringPA = 0, statusPA = 0, bootPA = 0, stampPA = 0;
     if (first) {
         const IOOptionBits opts = kIODirectionInOut | kIOMemoryPhysicallyContiguous;
@@ -253,6 +288,12 @@ bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
     if (!(sgRead(s, SGPU_REG_STATUS) & SGPU_ST_RING_ENABLED)) {
         ALOG("SoftGPU: RING_ENABLE refused (status 0x%x); is the device locked or monitorless?", sgRead(s, SGPU_REG_STATUS));
         return false;
+    }
+    // The device reset cleared the interrupt mask: DONE, FAULT and FATAL on again when the source is attached.
+    if (s->irq) {
+        sgWrite(s, SGPU_REG_IRQ_STATUS, SG_IRQ_CAUSES);
+        sgWrite(s, SGPU_REG_IRQ_MASK_SET, SG_IRQ_CAUSES);
+        s->irqOn = true;
     }
     // 5: the bootstrap descriptor, its stream in the bootstrap page read by GPA: CREATE_MEMORY id 1, the arena
     struct sgpu_mem_run runs[(SGPU_GUEST_ARENA_BYTES >> 14) + 1];
@@ -294,7 +335,7 @@ bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
     setProperty("SoftGPUEpoch", epoch, 64);               // the plug-in reads it after a failure (1.8, 4.6)
     setProperty("SoftGPUProtocol", (uint64_t)SGPU_VERSION, 32);
     s->on = true;
-    ALOG("SoftGPU: ring on, epoch %llu, probe stamp ok", epoch);
+    ALOG("SoftGPU: ring on, epoch %llu, probe stamp ok, completion by %s", epoch, s->irqOn ? "interrupt (poll as fallback)" : "poll");
     return true;
 }
 
@@ -306,6 +347,23 @@ void AdrenoAcceleratorX2::softgpuLost(int why)
     IOSimpleLock *lock = __atomic_load_n(&gSoftPendLock, __ATOMIC_ACQUIRE);
     if (lock) { IOSimpleLockLock(lock); gSoftPendCount = 0; IOSimpleLockUnlock(lock); }
     if (!softgpuBringUp(false)) ALOG("SoftGPU: reset failed; streams are refused until the next boot");
+}
+
+// The DONE interrupt (INTID 144 behind the monitor's forwarder, provider interrupt 0). Runs on the SoftGPU workloop, never
+// under fSubmitLock: it acks the causes it enabled (W1C) and wakes the waiter. RESET_DONE is not enabled; sgResetDevice polls it.
+void AdrenoAcceleratorX2::softgpuIrq(OSObject *owner, IOInterruptEventSource *, int)
+{
+    AdrenoAcceleratorX2 *self = OSDynamicCast(AdrenoAcceleratorX2, owner);
+    AdrenoSoftGPU *s = self ? __atomic_load_n(&self->fSoft, __ATOMIC_ACQUIRE) : nullptr;
+    if (!s || !s->base || !s->wake) return;
+    const uint32_t causes = sgRead(s, SGPU_REG_IRQ_STATUS) & SG_IRQ_CAUSES;
+    if (!causes) return;
+    sgWrite(s, SGPU_REG_IRQ_STATUS, causes);
+    __atomic_add_fetch(&s->irqCount, 1, __ATOMIC_RELAXED);
+    IOLockLock(s->wake);
+    s->irqSeq++;
+    IOLockUnlock(s->wake);
+    IOLockWakeup(s->wake, (void *)&s->irqSeq, false);
 }
 
 void AdrenoAcceleratorX2::softgpuStart(IOService *provider)
@@ -326,6 +384,22 @@ void AdrenoAcceleratorX2::softgpuStart(IOService *provider)
     }
     fSoft->reg = map;
     fSoft->base = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+    // The completion interrupt. Anything missing leaves the transport polled: nothing below needs it.
+    uint32_t noIrq = 0;         // boot-arg softgpu_nirq=1 forces the poll, for A/B runs
+    if (!(PE_parse_boot_argn("softgpu_nirq", &noIrq, sizeof noIrq) && noIrq)) {
+        fSoft->loop = IOWorkLoop::workLoop();
+        fSoft->wake = IOLockAlloc();
+        if (fSoft->loop && fSoft->wake) {
+            fSoft->irq = IOInterruptEventSource::interruptEventSource(this, &AdrenoAcceleratorX2::softgpuIrq, provider, 0);
+            if (fSoft->irq && fSoft->loop->addEventSource(fSoft->irq) == kIOReturnSuccess) {
+                fSoft->irq->enable();
+            } else {
+                ALOG("SoftGPU: no interrupt source on the provider, completion by poll");
+                if (fSoft->irq) { fSoft->loop->removeEventSource(fSoft->irq); }
+                OSSafeReleaseNULL(fSoft->irq);
+            }
+        }
+    }
     if (!__atomic_load_n(&gSoftPendLock, __ATOMIC_ACQUIRE))
         __atomic_store_n(&gSoftPendLock, IOSimpleLockAlloc(), __ATOMIC_RELEASE);
     IOLockLock(fSubmitLock);
@@ -333,6 +407,12 @@ void AdrenoAcceleratorX2::softgpuStart(IOService *provider)
     IOLockUnlock(fSubmitLock);
     if (!ok) { softgpuStop(); return; }
 #if ADRENO_SOFTGPU_SELFTEST
+    uint32_t w5 = 0;
+    if (PE_parse_boot_argn("softgpu_w5check", &w5, sizeof w5) && w5) {
+        IOLockLock(fSubmitLock);
+        softgpuW5Check();
+        IOLockUnlock(fSubmitLock);
+    }
     uint32_t selftest = 0;
     if (PE_parse_boot_argn("softgpu_selftest", &selftest, sizeof selftest) && selftest) {
         IOLockLock(fSubmitLock);
@@ -346,6 +426,13 @@ void AdrenoAcceleratorX2::softgpuStop()
 {
     AdrenoSoftGPU *s = fSoft;
     if (!s) return;
+    if (s->irq) {                                          // quiet the line, then take the source off before anything is freed
+        s->irqOn = false;
+        if (s->base) sgWrite(s, SGPU_REG_IRQ_MASK_CLR, 0xffffffffu);
+        s->irq->disable();
+        s->loop->removeEventSource(s->irq);                // returns once a handler in flight has finished
+        OSSafeReleaseNULL(s->irq);
+    }
     fSoft = nullptr;                                       // streams see INACTIVE from here on
     const bool quiet = !s->base || sgResetDevice(s);       // stop(): no host state left behind, once the device says so
     OSSafeReleaseNULL(s->reg);
@@ -359,6 +446,8 @@ void AdrenoAcceleratorX2::softgpuStop()
         // and the guest would reuse those pages: they are leaked on purpose (4 x 16 KiB plus the arena) for this boot.
         ALOG("SoftGPU: reset unconfirmed at stop; the ring, status, bootstrap and arena pages are kept");
     }
+    OSSafeReleaseNULL(s->loop);
+    if (s->wake) IOLockFree(s->wake);
     IOFree(s, sizeof(AdrenoSoftGPU));
 }
 
@@ -421,12 +510,103 @@ void AdrenoAcceleratorX2::softgpuSelfTest()
 }
 #endif
 
+#if ADRENO_SOFTGPU_SELFTEST
+// W5 pass checks (plans/p6-softgpu-integration.md W5, spec 1.3): the device must refuse memory the monitor withholds.
+// softgpu_w5check=1 with softgpu_w5_monitor_pa=<hex> (a page of the monitor's work area) and softgpu_w5_trust_pa=<hex> (the
+// static trust cache). Debug builds only. The one write attempted is a single byte over the trust cache holding the value it
+// already has, so a monitorless boot (where the write would succeed) changes nothing.
+void AdrenoAcceleratorX2::softgpuW5Check()
+{
+    AdrenoSoftGPU *s = fSoft;
+    uint64_t monitor = 0, trust = 0;
+    PE_parse_boot_argn("softgpu_w5_monitor_pa", &monitor, sizeof monitor);
+    PE_parse_boot_argn("softgpu_w5_trust_pa", &trust, sizeof trust);
+    bool pass = true;
+    auto destroy = [&](uint32_t id) {
+        const int d = sgKernel(s, sizeof(struct sgpu_destroy_memory), 0, SGPU_GUEST_NO_STAMP, 0,
+                               [&](uint8_t *p) { return sgpu_guest_pkt_destroy_memory(p, sizeof(struct sgpu_destroy_memory), id); });
+        if (d || sgDrain(s, SG_BUDGET_MS)) ALOG("SoftGPU: W5 check: DESTROY_MEMORY %u failed", id);
+    };
+    // FILL_BUFFER of `bytes` with `value` over object `id`, bound WRITE. The stream's status.
+    auto fill = [&](uint32_t id, uint64_t bytes, uint32_t value) {
+        struct sgpu_guest_bt_in in = {id, ADRENO_USAGE_WRITE, 0, 0, bytes, 0};
+        uint64_t off = 0, seq = 0;
+        int r = sgpu_guest_arena_alloc(&s->arena, sizeof(struct sgpu_fill_buffer) + sizeof(struct sgpu_bt_entry), s->ring.next_seqno, &off);
+        if (r) return r;
+        sgpu_guest_pkt_fill_buffer(s->arenaVA + off, sizeof(struct sgpu_fill_buffer), 0, 0, bytes, value);
+        sgpu_guest_bt_build(reinterpret_cast<struct sgpu_bt_entry *>(s->arenaVA + off + sizeof(struct sgpu_fill_buffer)), &in, 1);
+        struct sgpu_desc d;
+        sgpu_guest_desc_submit(&d, 1, ++s->cbSerial, SGPU_DESC_LAST, off, sizeof(struct sgpu_fill_buffer),
+                               off + sizeof(struct sgpu_fill_buffer), 1, SGPU_GUEST_NO_STAMP, 0, 0, 0);
+        r = sgPush(s, &d, &seq);
+        return r ? r : sgDrain(s, SG_BUDGET_MS + SG_COMPILE_MS);
+    };
+    sgFlushPending(s);
+    // 1. a monitor page: no window, so CREATE_MEMORY itself fails with SGPU_E_MEMORY
+    if (monitor) {
+        const uint32_t id = s->nextMem++;
+        struct sgpu_mem_run run = {monitor & ~0x3fffull, 0x4000};
+        const int r = sgCreateMemory(s, id, 0, 0x4000, 0, &run, 1);
+        const bool ok = r == SGPU_E_MEMORY;
+        ALOG("SoftGPU: W5 monitor page 0x%llx: CREATE_MEMORY status %d, want %d (SGPU_E_MEMORY): %s", run.gpa, r, SGPU_E_MEMORY, ok ? "ok" : "FAILED");
+        if (!r) destroy(id);
+        pass &= ok;
+    }
+    // 2. the trust cache: readable (a READ window), but a WRITE binding is refused
+    if (trust) {
+        const uint32_t id = s->nextMem++;
+        struct sgpu_mem_run run = {trust & ~0x3fffull, 0x4000};
+        uint8_t keep = 0;
+        IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(run.gpa, 0x4000, kIODirectionIn);
+        if (md && md->prepare() == kIOReturnSuccess) { md->readBytes(0, &keep, 1); md->complete(); }
+        OSSafeReleaseNULL(md);
+        int r = sgCreateMemory(s, id, 0, 0x4000, 0, &run, 1);
+        ALOG("SoftGPU: W5 trust cache 0x%llx: CREATE_MEMORY (read) status %d, want 0: %s", run.gpa, r, r ? "FAILED" : "ok");
+        pass &= !r;
+        if (!r) {
+            r = fill(id, 1, keep);
+            const bool ok = r == SGPU_E_ACCESS || r == SGPU_E_MEMORY;
+            ALOG("SoftGPU: W5 trust cache WRITE binding: status %d, want %d (SGPU_E_ACCESS) or %d (SGPU_E_MEMORY, the device's code for a window without WRITE): %s",
+                 r, SGPU_E_ACCESS, SGPU_E_MEMORY, ok ? "ok" : "FAILED");
+            pass &= ok;
+            destroy(id);
+        }
+    }
+    // 3. control: ordinary kernel memory takes the same write, so the refusals above are the windows' doing
+    {
+        IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x4000, 0x4000);
+        uint64_t pa = 0;
+        if (md && md->prepare() == kIOReturnSuccess && sgContiguous(md, &pa)) {
+            uint8_t *va = static_cast<uint8_t *>(md->getBytesNoCopy());
+            bzero(va, 0x4000);
+            const uint32_t id = s->nextMem++;
+            struct sgpu_mem_run run = {pa, 0x4000};
+            int r = sgCreateMemory(s, id, 0, 0x4000, 0, &run, 1);
+            if (!r) r = fill(id, 64, 0x5a);
+            bool same = true;
+            for (unsigned i = 0; i < 64; i++) same &= va[i] == 0x5a;
+            const bool ok = !r && same && va[64] == 0;
+            ALOG("SoftGPU: W5 control page 0x%llx: write status %d, bytes %s: %s", pa, r, same ? "0x5a" : "unchanged", ok ? "ok" : "FAILED");
+            pass &= ok;
+            if (!r || r == SGPU_E_ACCESS || r == SGPU_E_MEMORY) destroy(id);
+            md->complete();
+        } else {
+            ALOG("SoftGPU: W5 control page: no contiguous memory");
+            pass = false;
+        }
+        OSSafeReleaseNULL(md);
+    }
+    ALOG("SoftGPU: W5 check %s (windows, lock and refusals)", pass ? "PASSED" : "FAILED");
+    setProperty("SoftGPUW5", pass ? 1ULL : 0ULL, 32);
+}
+#endif
+
 // SOFTGPU_KCMD_STREAM. Entries of the segment list become binding-table entries in list order; their memory objects
 // are created on first use from the map's physical runs. 0, or an SGPU_E_* / ADRENO_* result for submission error 0xa
 // (the queue maps SGPU_E_* through sgpu_guest_iogpu_status).
-// TODO(W5, softgpu/SOFTGPU-PROTOCOL.md review item M7): fSubmitLock is held while this sleeps in the completion polls, up
-// to SG_BUDGET_MS + SG_COMPILE_MS + 3 s (about 25 s) for a stream. W5 moves completion to the IRQ on its own workloop so
-// the lock is dropped across the wait; until then every other submitter and the IB path queue behind a slow compile.
+// TODO(spec review item M7): fSubmitLock is still held while this sleeps for the completion (up to SG_BUDGET_MS +
+// SG_COMPILE_MS + 3 s, about 25 s, for a stream), now on the interrupt instead of a poll. Dropping it across the wait needs the
+// ring and the arena owned by one more lock; W5 did not change who may submit while a slow compile runs.
 int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *command, uint64_t bytes)
 {
     if (!list || !command) return ADRENO_LIST_E_ARGUMENT;
@@ -539,6 +719,11 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
         result = ADRENO_SUBMIT_E_INACTIVE;
     }
     IOLockUnlock(fSubmitLock);
+    if (s && s == fSoft && s->irq) {                            // what the board check reads from ioreg
+        setProperty("SoftGPUIrqs", __atomic_load_n(&s->irqCount, __ATOMIC_RELAXED), 64);
+        setProperty("SoftGPUIrqWakes", s->irqWakes, 64);
+        setProperty("SoftGPUPollWakes", s->pollWakes, 64);
+    }
     result = sgpu_guest_public_result(result);                  // SGPU_GUEST_BUSY / _E_RECORD are host-only codes
     if (result && result != ADRENO_SUBMIT_E_INACTIVE)
         ALOG("SoftGPU: stream refused %d at packet 0x%x", result, packetOffset);

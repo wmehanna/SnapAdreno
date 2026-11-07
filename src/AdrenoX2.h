@@ -119,6 +119,8 @@ extern "C" uint64_t AdrenoGPUMapBudget(void);   // AdrenoMemoryMap.cpp: the resi
 #endif
 #if ADRENO_SOFTGPU
 #include "../../../../compat/softgpu-guest.h"
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOInterruptEventSource.h>   // W5: the DONE interrupt
 extern "C" void AdrenoSoftGPUMapGone(uint32_t id, uint64_t epoch);   // AdrenoX2.cpp: a map gave up its backing
 #endif
 #if ADRENO_PIPELINE
@@ -448,8 +450,10 @@ private:
     void softgpuStop();
     bool softgpuBringUp(bool first);          // spec 1.9; fSubmitLock held
     void softgpuLost(int why);                // RESET_DEVICE and a new epoch; fSubmitLock held
+    static void softgpuIrq(OSObject *owner, IOInterruptEventSource *source, int count);   // the DONE interrupt (W5)
 #if ADRENO_SOFTGPU_SELFTEST
     void softgpuSelfTest();                   // boot-arg softgpu_selftest=1; fSubmitLock held
+    void softgpuW5Check();                    // boot-arg softgpu_w5check=1: the window refusals; fSubmitLock held
 #endif
     struct AdrenoSoftGPU *fSoft;
 #endif
