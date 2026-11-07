@@ -175,6 +175,10 @@ static struct adreno_recover_guest gAdrenoRecover;
 static const struct adreno_recover_ops kAdrenoRecoverOps = {nullptr, ibAsyncHVC};
 #endif
 
+#if ADRENO_SOFTGPU
+// IOGPUDevice::getGPUTask: the task a command buffer's device belongs to, whose SoftGPU context its stream runs in.
+extern "C" IOGPUTask *AdrenoDeviceGPUTask(const IOGPUDevice *) __asm__("__ZNK11IOGPUDevice10getGPUTaskEv");
+#endif
 #if ADRENO_PIPELINE
 #if !ADRENO_IB_ASYNC || !ADRENO_PRESENT_SYNC
 #error "ADRENO_PIPELINE needs ADRENO_IB_ASYNC (IB_START/IB_POLL) and ADRENO_PRESENT_SYNC (the marks the display waits on)"

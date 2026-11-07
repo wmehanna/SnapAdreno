@@ -19,6 +19,7 @@ struct AdrenoSoftGPU {
     uint64_t epoch;          // the device epoch the objects below belong to (atomic: read outside fSubmitLock)
     uint32_t nextMem;        // memory object ids are never reused within an epoch
     uint32_t cbSerial;
+    struct sgpu_ctx_book ctxs;   // the per-task contexts of this epoch (softgpu-ctx.h); under fSubmitLock
     uint32_t features;
     bool on;
     bool resetUnconfirmed;      // the last RESET_DEVICE never raised RESET_DONE: the device may still DMA
@@ -44,6 +45,18 @@ extern "C" void AdrenoSoftGPUMapGone(uint32_t id, uint64_t epoch)
     IOSimpleLockUnlock(lock);
 }
 
+// The contexts of tasks that died (AdrenoTask::free), under the same lock: they cannot take fSubmitLock there either, so
+// the next stream sends their DESTROY_CONTEXT. Epoch-tagged like the memory ids.
+static struct sgpu_ctx_pend gSoftCtxPend;
+extern "C" void AdrenoSoftGPUCtxGone(uint32_t id, uint64_t epoch)
+{
+    IOSimpleLock *lock = __atomic_load_n(&gSoftPendLock, __ATOMIC_ACQUIRE);
+    if (!lock || !id || epoch != __atomic_load_n(&gSoftEpoch, __ATOMIC_RELAXED)) return;
+    IOSimpleLockLock(lock);
+    const int r = sgpu_ctx_pend_push(&gSoftCtxPend, id, epoch);
+    IOSimpleLockUnlock(lock);
+    if (r) ALOG("SoftGPU: context %u of a dead task is kept until the next reset (pending list full)", id);
+}
 #define SG_BUDGET_MS 2000u
 #define SG_COMPILE_MS 20000u      // COMPILE_BUDGET_MS register default; W4 measures before this moves
 static inline uint32_t sgRead(AdrenoSoftGPU *s, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(s->base + off); }
@@ -158,8 +171,8 @@ static int sgDrain(AdrenoSoftGPU *s, uint32_t ms)
 // belong to no stream: a refusal is logged and dropped, only a lost device (SGPU_E_LOST) is the caller's.
 static int sgFlushPending(AdrenoSoftGPU *s)
 {
-    uint32_t ids[64];
-    uint32_t n = 0;
+    uint32_t ids[64], ctxIds[16];
+    uint32_t n = 0, nctx = 0;
     IOSimpleLock *lock = __atomic_load_n(&gSoftPendLock, __ATOMIC_ACQUIRE);
     if (!lock) return 0;
     for (;;) {
@@ -169,8 +182,20 @@ static int sgFlushPending(AdrenoSoftGPU *s)
             gSoftPendCount--;
             if (gSoftPend[gSoftPendCount].epoch == s->epoch) ids[n++] = gSoftPend[gSoftPendCount].id;
         }
-        const bool more = gSoftPendCount != 0;
+        nctx = sgpu_ctx_pend_take(&gSoftCtxPend, s->epoch, ctxIds, 16);
+        const bool more = gSoftPendCount != 0 || gSoftCtxPend.n != 0;
         IOSimpleLockUnlock(lock);
+        if (nctx) {
+            // A dead task's context: its objects go with it, its memory objects stay (the maps retire those).
+            int r = 0;
+            for (uint32_t i = 0; i < nctx && !r; i++)
+                r = sgKernel(s, sizeof(struct sgpu_destroy_context), 0, SGPU_GUEST_NO_STAMP, 0,
+                             [&](uint8_t *p) { return sgpu_guest_pkt_destroy_context(p, sizeof(struct sgpu_destroy_context), ctxIds[i]); });
+            if (!r) r = sgDrain(s, SG_BUDGET_MS);
+            if (r) ALOG("SoftGPU: DESTROY_CONTEXT of %u contexts failed %d", nctx, r);
+            if ((r = sgpu_guest_housekeeping_result(r))) return r;     // lost: the reset forgets every context
+            sgpu_ctx_destroyed(&s->ctxs, nctx);
+        }
         if (n) {
             int r = 0;
             for (uint32_t i = 0; i < n && !r; i++)
@@ -195,6 +220,14 @@ static int sgCreateMemory(AdrenoSoftGPU *s, uint32_t id, uint32_t flags, uint64_
     return r ? r : sgDrain(s, SG_BUDGET_MS);
 }
 
+// CREATE_CONTEXT for `id`, completed before it returns (the queue holds nothing else: sgFlushPending drained it). The
+// caller records the context only on 0 (sgpu_ctx_made). Under fSubmitLock.
+static int sgCreateContext(AdrenoSoftGPU *s, uint32_t id)
+{
+    int r = sgKernel(s, sizeof(struct sgpu_create_context), 0, SGPU_GUEST_NO_STAMP, 0, [&](uint8_t *p) {
+        return sgpu_guest_pkt_create_context(p, sizeof(struct sgpu_create_context), id); });
+    return r ? r : sgDrain(s, SG_BUDGET_MS);
+}
 // Spec 1.9 steps 1 to 6 on a device in any state. Allocations are made once (first); a reset reruns the rest.
 bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
 {
@@ -274,10 +307,8 @@ bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
     int r = sgPush(s, &d, &seq);
     if (!r) r = sgWaitDone(s, seq, SG_BUDGET_MS, nullptr);
     if (r) { ALOG("SoftGPU: arena registration failed %d", r); return false; }
-    // CREATE_CONTEXT 1: one context for every task in this wave
+    // No context is made here: each task creates its own on its first stream (submitStream, softgpu-ctx.h).
     s->nextMem = 2;
-    r = sgKernel(s, sizeof(struct sgpu_create_context), 0, SGPU_GUEST_NO_STAMP, 0,
-                 [&](uint8_t *p) { return sgpu_guest_pkt_create_context(p, sizeof(struct sgpu_create_context), 1); });
     // 6: probe STAMP into slot 128 and read it back from the stamp page
     const uint32_t probe = 0x50f70000u | (uint32_t)(first ? 1 : 2);
     if (!r) r = sgKernel(s, sizeof(struct sgpu_stamp), SGPU_DESC_IRQ, SGPU_GUEST_NO_STAMP, 0, [&](uint8_t *p) {
@@ -291,6 +322,7 @@ bool AdrenoAcceleratorX2::softgpuBringUp(bool first)
     const uint64_t epoch = *reinterpret_cast<volatile uint64_t *>(s->statusVA + 32);
     __atomic_store_n(&s->epoch, epoch, __ATOMIC_RELEASE);
     __atomic_store_n(&gSoftEpoch, epoch, __ATOMIC_RELEASE);
+    sgpu_ctx_book_reset(&s->ctxs, epoch);                   // the host holds no context: every task asks for a new one
     setProperty("SoftGPUEpoch", epoch, 64);               // the plug-in reads it after a failure (1.8, 4.6)
     setProperty("SoftGPUProtocol", (uint64_t)SGPU_VERSION, 32);
     s->on = true;
@@ -304,7 +336,7 @@ void AdrenoAcceleratorX2::softgpuLost(int why)
 {
     ALOG("SoftGPU: device lost (%d), resetting", why);
     IOSimpleLock *lock = __atomic_load_n(&gSoftPendLock, __ATOMIC_ACQUIRE);
-    if (lock) { IOSimpleLockLock(lock); gSoftPendCount = 0; IOSimpleLockUnlock(lock); }
+    if (lock) { IOSimpleLockLock(lock); gSoftPendCount = 0; gSoftCtxPend.n = 0; IOSimpleLockUnlock(lock); }
     if (!softgpuBringUp(false)) ALOG("SoftGPU: reset failed; streams are refused until the next boot");
 }
 
@@ -396,6 +428,14 @@ void AdrenoAcceleratorX2::softgpuSelfTest()
     struct sgpu_mem_run run = {pa & ~0xfffull, ((pa & 0xfff) + bytes + 0xfff) & ~0xfffull};
     const uint32_t id = s->nextMem++;
     int r = sgFlushPending(s);
+    // The fill is a SUBMIT descriptor, which needs a context: a throwaway one owned by the self-test.
+    struct sgpu_ctx_owner owner = {};
+    uint32_t ctx = 0;
+    int create = 0;
+    if (!r) r = sgpu_ctx_want(&s->ctxs, &owner, &ctx, &create);
+    if (!r) r = sgCreateContext(s, ctx);
+    const bool ctxMade = !r;
+    if (ctxMade) sgpu_ctx_made(&s->ctxs, &owner, ctx);
     if (!r) r = sgCreateMemory(s, id, 0, bytes, (uint32_t)(pa & 0xfff), &run, 1);
     const bool created = !r;
     struct sgpu_guest_bt_in in = {id, ADRENO_USAGE_WRITE, 0, 0, bytes, 0};
@@ -405,7 +445,7 @@ void AdrenoAcceleratorX2::softgpuSelfTest()
         sgpu_guest_pkt_fill_buffer(s->arenaVA + off, sizeof(struct sgpu_fill_buffer), 0, 0, bytes, fillByte);
         sgpu_guest_bt_build(reinterpret_cast<struct sgpu_bt_entry *>(s->arenaVA + off + sizeof(struct sgpu_fill_buffer)), &in, 1);
         struct sgpu_desc d;
-        sgpu_guest_desc_submit(&d, 1, ++s->cbSerial, SGPU_DESC_LAST, off, sizeof(struct sgpu_fill_buffer),
+        sgpu_guest_desc_submit(&d, ctx, ++s->cbSerial, SGPU_DESC_LAST, off, sizeof(struct sgpu_fill_buffer),
                                off + sizeof(struct sgpu_fill_buffer), 1, SGPU_GUEST_NO_STAMP, 0, 0, 0);
         r = sgPush(s, &d, &seq);
     }
@@ -417,6 +457,14 @@ void AdrenoAcceleratorX2::softgpuSelfTest()
         const int d = sgKernel(s, sizeof(struct sgpu_destroy_memory), 0, SGPU_GUEST_NO_STAMP, 0,
                                [&](uint8_t *p) { return sgpu_guest_pkt_destroy_memory(p, sizeof(struct sgpu_destroy_memory), id); });
         if (d || (r = sgDrain(s, SG_BUDGET_MS))) ALOG("SoftGPU: self-test: DESTROY_MEMORY %u failed %d", id, d ? d : r);
+    }
+    if (ctxMade && r != SGPU_E_LOST && r != SGPU_E_TIMEOUT) {
+        uint64_t e = 0;
+        const uint32_t gone = sgpu_ctx_owner_take(&owner, &e);
+        const int d = sgKernel(s, sizeof(struct sgpu_destroy_context), 0, SGPU_GUEST_NO_STAMP, 0,
+                               [&](uint8_t *p) { return sgpu_guest_pkt_destroy_context(p, sizeof(struct sgpu_destroy_context), gone); });
+        if (d || (r = sgDrain(s, SG_BUDGET_MS))) ALOG("SoftGPU: self-test: DESTROY_CONTEXT %u failed %d", gone, d ? d : r);
+        else sgpu_ctx_destroyed(&s->ctxs, 1);
     }
 }
 #endif
@@ -432,6 +480,12 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
     if (!list || !command) return ADRENO_LIST_E_ARGUMENT;
     AdrenoSoftGPU *s = fSoft;
     if (!s || !fSubmitLock) return ADRENO_SUBMIT_E_INACTIVE;
+    // The submitting task is the command buffer's device's: its SoftGPU context is the only one this stream may run in.
+    // The plug-in's stream names no context (the host refuses the context packets there), and the id is never read from
+    // user memory.
+    IOGPUDevice *dev = list->softgpuDevice();
+    AdrenoTask *task = OSDynamicCast(AdrenoTask, dev ? AdrenoDeviceGPUTask(dev) : nullptr);
+    if (!task) return SGPU_E_OBJECT;
     // Before the lock (map locks are taken inside the IB path under fSubmitLock, never the other way round): the runs
     // of every entry whose memory object is missing or from an older epoch. They go into one pool that grows with what
     // the maps really have (a map has few runs, not one per page), once per distinct map, up to
@@ -476,7 +530,7 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
     if (distinct) IOFree(distinct, (size_t)distinctSlots * sizeof *distinct);
     IOLockLock(fSubmitLock);
     s = fSoft;
-    uint32_t packetOffset = 0;
+    uint32_t packetOffset = 0, ctx = 0;
     bool stale = false, wedged = false;
     if (!result && s && s->on) {
         result = sgFlushPending(s);                         // DESTROYs of dead objects: only a lost device is this stream's
@@ -485,6 +539,16 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
         if (!result) {
             result = sgpu_guest_kcmd_stream(command, bytes, __atomic_load_n(&s->epoch, __ATOMIC_RELAXED), &stream, &sbytes);
             if (result) stale = true;                       // a stale plug-in epoch is refused (status 5), it never resets
+        }
+        if (!result) {
+            // this task's context: made on its first stream (or the first after a reset), bounded (softgpu-ctx.h)
+            int create = 0;
+            result = sgpu_ctx_want(&s->ctxs, task->softgpuContext(), &ctx, &create);
+            if (!result && create) {
+                result = sgCreateContext(s, ctx);
+                if (!result) sgpu_ctx_made(&s->ctxs, task->softgpuContext(), ctx);
+            }
+            if (result == SGPU_E_QUOTA) ALOG("SoftGPU: no context for a new task (%u live)", s->ctxs.live);
         }
         // memory objects of this epoch for every entry (a stale id with no runs captured means a reset raced us)
         for (uint64_t i = 0; i < count && !result; i++) {
@@ -510,7 +574,7 @@ int AdrenoAcceleratorX2::submitStream(AdrenoSegmentList *list, const void *comma
                     sgpu_guest_bt_build(&bt[i], &in, 1);
                 }
                 struct sgpu_desc d;
-                sgpu_guest_desc_submit(&d, 1, ++s->cbSerial, SGPU_DESC_LAST, off, sbytes, off + sbytes, (uint32_t)count,
+                sgpu_guest_desc_submit(&d, ctx, ++s->cbSerial, SGPU_DESC_LAST, off, sbytes, off + sbytes, (uint32_t)count,
                                        SGPU_GUEST_NO_STAMP, 0, 0, (uint64_t)(uintptr_t)list);
                 result = sgPush(s, &d, &seq);
                 if (result == SGPU_GUEST_BUSY && !(result = sgDrain(s, SG_BUDGET_MS))) result = sgPush(s, &d, &seq);

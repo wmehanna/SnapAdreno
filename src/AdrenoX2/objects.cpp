@@ -76,6 +76,11 @@ void AdrenoTask::free()
     uint32_t allocations = __atomic_load_n(&fAllocations, __ATOMIC_RELAXED);
     if (fWindowServer && allocations)
         AdrenoEarlyStopClientDied((uint64_t)fSequence << 32 | allocations);
+#if ADRENO_SOFTGPU
+    uint64_t ctxEpoch = 0;
+    const uint32_t ctx = sgpu_ctx_owner_take(&fSoftCtx, &ctxEpoch);
+    if (ctx) AdrenoSoftGPUCtxGone(ctx, ctxEpoch);      // the next stream destroys it, with all of its objects
+#endif
     IOGPUTask::free();
 }
 

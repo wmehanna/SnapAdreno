@@ -119,7 +119,9 @@ extern "C" uint64_t AdrenoGPUMapBudget(void);   // AdrenoMemoryMap.cpp: the resi
 #endif
 #if ADRENO_SOFTGPU
 #include "../../../../compat/softgpu-guest.h"
+#include "AdrenoX2/softgpu-ctx.h"
 extern "C" void AdrenoSoftGPUMapGone(uint32_t id, uint64_t epoch);   // AdrenoX2.cpp: a map gave up its backing
+extern "C" void AdrenoSoftGPUCtxGone(uint32_t id, uint64_t epoch);   // AdrenoX2.cpp: a task died with this SoftGPU context
 #endif
 #if ADRENO_PIPELINE
 #include <IOKit/IOWorkLoop.h>
@@ -287,7 +289,15 @@ public:
 #if ADRENO_PIPELINE
     bool pipelineClient() const { return fPipelineClient; }   // WindowServer's task (adreno_pipeline=1)
 #endif
+#if ADRENO_SOFTGPU
+    // The task's SoftGPU context (softgpu-ctx.h): read and made under the accelerator's fSubmitLock; handed to the
+    // pending list by free(), when no stream of this task can still be running.
+    struct sgpu_ctx_owner *softgpuContext() { return &fSoftCtx; }
+#endif
 private:
+#if ADRENO_SOFTGPU
+    struct sgpu_ctx_owner fSoftCtx;
+#endif
     bool fWindowServer;           // owner holds WindowServer's own entitlements (withTask)
     uint32_t fSequence;           // nth WindowServer task of this boot, from 1
     uint32_t fAllocations;        // successful allocate() calls, saturating
@@ -320,6 +330,7 @@ public:
     void retainAfterTimeout();
 #if ADRENO_SOFTGPU
     // The prepared entries in list order (binding-table order): their maps and IOGPU usage bits.
+    IOGPUDevice *softgpuDevice() const { return fDevice; }      // names the submitting task, hence its SoftGPU context
     uint64_t entryCount() const { return fResources.ready ? fResources.count : 0; }
     bool entryAt(uint64_t i, AdrenoMemoryMap **map, uint32_t *usage, uint32_t *id) const
     {
