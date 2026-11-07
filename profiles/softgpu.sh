@@ -9,7 +9,10 @@
 # the 64 rows at the start of the boot console's framebuffer (softgpu_selftest_pa=<hex> moves the start inside it,
 # softgpu_selftest_row sets the row bytes, default the console's) with softgpu_selftest_byte (default 0xc0) through the
 # device at start, then destroys its object. Rollback is the old KC.
-. "$D/profiles/desktop-next.sh"
+# Base: the default build (what the board monitor, built without ADRENO_VA_WIDE, runs: raw17). A desktop-next base is wide
+# (-DADRENO_VA_WIDE=1) and refuses to start on that monitor ("GPU VA width 0 in the tree, 34 in this kext"); opt in with
+# SOFTGPU_BASE=desktop-next for a -DADRENO_VA_WIDE=1 monitor and SNAP_ADRENO_VA_WIDE=1.
+[ "${SOFTGPU_BASE:-}" != desktop-next ] || . "$D/profiles/desktop-next.sh"
 PROFILE_SOFTGPU="-DADRENO_SOFTGPU=1"
 [ -z "${SOFTGPU_SELFTEST:-}" ] || PROFILE_SOFTGPU="$PROFILE_SOFTGPU -DADRENO_SOFTGPU_SELFTEST=1"
 U_AdrenoX2="$U_AdrenoX2 $PROFILE_SOFTGPU"
