@@ -7,7 +7,10 @@
 //     never supplies it: CREATE_CONTEXT and DESTROY_CONTEXT are kernel packets the host refuses in a SUBMIT stream,
 //     and the id in a SUBMIT descriptor comes from the task that owns the command buffer's device.
 //   - At most SGPU_CTX_MAX_LIVE contexts exist at once (the host stops at 64); a task asking for one past that is
-//     refused with SGPU_E_QUOTA, and the contexts of dead tasks are destroyed before the next one is made.
+//     refused with SGPU_E_QUOTA, and the contexts of dead tasks are destroyed before the next one is made. The bound is
+//     shared out so one process cannot starve the others: at most SGPU_CTX_PER_PID contexts per process (a process opens
+//     one IOGPU device, hence one task, per connection), and SGPU_CTX_WS_RESERVE of the slots are for WindowServer's
+//     tasks only (the entitlement check of AdrenoTask::withTask), so a flood of other clients never keeps it out.
 //   - A task's context dies with the task: its owner record is handed to the pending list, and the next stream
 //     (under the submit lock) sends DESTROY_CONTEXT, which frees the context's objects and no memory object.
 //   - After a device reset the host holds no context: a record from an older epoch is simply replaced by a new context.
@@ -16,16 +19,22 @@
 #include <stdint.h>
 
 #define SGPU_CTX_MAX_LIVE 32u      /* contexts at once; the host's own ceiling is 64 (sgpu_exec.cpp) */
+#define SGPU_CTX_PER_PID 8u        /* contexts one process (pid) may hold at once */
+#define SGPU_CTX_WS_RESERVE 4u     /* of SGPU_CTX_MAX_LIVE, the slots only a WindowServer task may take */
 #define SGPU_CTX_PEND_MAX 64u      /* dead tasks whose DESTROY_CONTEXT has not been sent yet */
 
 struct sgpu_ctx_owner {            /* a task's context: lives inside AdrenoTask */
     uint64_t epoch;                /* the device epoch `id` belongs to */
     uint32_t id;                   /* 0 none */
+    int32_t pid;                   /* the process that owns the task; set once, when the task is made */
+    uint32_t ws;                   /* 1: WindowServer's task (may use the reserved slots); set once */
 };
+struct sgpu_ctx_slot { uint32_t id; int32_t pid; uint32_t ws; };    /* id 0: free */
 struct sgpu_ctx_book {             /* the device's: under fSubmitLock */
     uint64_t epoch;
     uint32_t next;                 /* the next id, from 1; never reused within an epoch */
-    uint32_t live;                 /* made in this epoch, destroy not yet sent */
+    uint32_t live;                 /* made in this epoch, destroy not yet sent (the used slots) */
+    struct sgpu_ctx_slot slot[SGPU_CTX_MAX_LIVE];
 };
 struct sgpu_ctx_pend {             /* the dead tasks' contexts; the kext guards it with a spin lock */
     uint32_t n;
@@ -38,13 +47,23 @@ static inline void sgpu_ctx_book_reset(struct sgpu_ctx_book *b, uint64_t epoch)
     b->epoch = epoch;
     b->next = 1;
     b->live = 0;
+    for (uint32_t i = 0; i < SGPU_CTX_MAX_LIVE; i++) b->slot[i].id = 0;
 }
 /* The context id for a descriptor of the task owning `o`: *id, and *create = 1 when CREATE_CONTEXT must be sent first.
- * 0, or SGPU_E_QUOTA at the live limit or when the counter ran out. Nothing is recorded until sgpu_ctx_made. */
+ * 0, or SGPU_E_QUOTA at the live limit, past the process's SGPU_CTX_PER_PID, for a task that is not WindowServer's when
+ * only the reserved slots are left, or when the counter ran out. Nothing is recorded until sgpu_ctx_made. */
 static inline int sgpu_ctx_want(const struct sgpu_ctx_book *b, const struct sgpu_ctx_owner *o, uint32_t *id, int *create)
 {
     if (o->id && o->epoch == b->epoch) { *id = o->id; *create = 0; return 0; }
     if (b->live >= SGPU_CTX_MAX_LIVE || !b->next || b->next == 0xffffffffu) return SGPU_E_QUOTA;
+    uint32_t mine = 0, others = 0;
+    for (uint32_t i = 0; i < SGPU_CTX_MAX_LIVE; i++) {
+        if (!b->slot[i].id) continue;
+        if (b->slot[i].pid == o->pid) mine++;
+        if (!b->slot[i].ws) others++;
+    }
+    if (mine >= SGPU_CTX_PER_PID) return SGPU_E_QUOTA;
+    if (!o->ws && others >= SGPU_CTX_MAX_LIVE - SGPU_CTX_WS_RESERVE) return SGPU_E_QUOTA;
     *id = b->next;
     *create = 1;
     return 0;
@@ -53,7 +72,14 @@ static inline int sgpu_ctx_want(const struct sgpu_ctx_book *b, const struct sgpu
 static inline void sgpu_ctx_made(struct sgpu_ctx_book *b, struct sgpu_ctx_owner *o, uint32_t id)
 {
     b->next = id + 1;
-    b->live++;
+    for (uint32_t i = 0; i < SGPU_CTX_MAX_LIVE; i++)
+        if (!b->slot[i].id) {
+            b->slot[i].id = id;
+            b->slot[i].pid = o->pid;
+            b->slot[i].ws = o->ws;
+            b->live++;
+            break;
+        }
     o->id = id;
     o->epoch = b->epoch;
 }
@@ -86,8 +112,81 @@ static inline uint32_t sgpu_ctx_pend_take(struct sgpu_ctx_pend *p, uint64_t epoc
     }
     return n;
 }
-/* `n` DESTROY_CONTEXT descriptors went out: they no longer count against the limit. */
-static inline void sgpu_ctx_destroyed(struct sgpu_ctx_book *b, uint32_t n)
+/* DESTROY_CONTEXT for `id` went out: it no longer counts against any limit. An id the book does not hold (a reset
+ * already forgot it) changes nothing. */
+static inline void sgpu_ctx_destroyed(struct sgpu_ctx_book *b, uint32_t id)
 {
-    b->live = n < b->live ? b->live - n : 0;
+    if (!id) return;
+    for (uint32_t i = 0; i < SGPU_CTX_MAX_LIVE; i++)
+        if (b->slot[i].id == id) { b->slot[i].id = 0; if (b->live) b->live--; return; }
+}
+
+/* ---- the wiring: what AdrenoAcceleratorX2::submitStream, sgFlushPending and AdrenoTask::free do with the rules above,
+ * as functions the kext calls and tests/test-softgpu-ctx.c drives with a model of the device. ---- */
+
+/* A dead task's context goes to the pending list through `gone` (the epoch-checking, locking hook); nothing if it has none. */
+static inline void sgpu_ctx_task_gone(struct sgpu_ctx_owner *o, void (*gone)(uint32_t id, uint64_t epoch))
+{
+    uint64_t epoch = 0;
+    const uint32_t id = sgpu_ctx_owner_take(o, &epoch);
+    if (id) gone(id, epoch);
+}
+/* Send DESTROY_CONTEXT for ids[0..n) in order through `send` (0: the descriptor is queued). Every queued id leaves the book;
+ * at the first failure (*err) the rest are not sent and the count returned says where to resume: the caller puts
+ * ids[count..n) back on the pending list, so the book and the device never disagree about a context that is still there. */
+static inline uint32_t sgpu_ctx_destroy_batch(struct sgpu_ctx_book *b, const uint32_t *ids, uint32_t n,
+                                              int (*send)(void *cookie, uint32_t id), void *cookie, int *err)
+{
+    uint32_t i = 0;
+    *err = 0;
+    for (; i < n; i++) {
+        const int r = send(cookie, ids[i]);
+        if (r) { *err = r; break; }
+        sgpu_ctx_destroyed(b, ids[i]);
+    }
+    return i;
+}
+/* Put ids back on the pending list (epoch `epoch`); returns how many did not fit (they live until the next reset). */
+static inline uint32_t sgpu_ctx_requeue(struct sgpu_ctx_pend *p, const uint32_t *ids, uint32_t n, uint64_t epoch)
+{
+    uint32_t lost = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (sgpu_ctx_pend_push(p, ids[i], epoch)) lost++;
+    return lost;
+}
+
+struct sgpu_ctx_ops {              /* the device side of a stream, under fSubmitLock */
+    int (*flush)(void *cookie);                 /* sgFlushPending: DESTROYs of dead objects and contexts */
+    int (*create)(void *cookie, uint32_t id);   /* sgCreateContext */
+    void *cookie;
+};
+struct sgpu_ctx_stream {           /* the context a stream runs in: the only place a descriptor's context id comes from */
+    uint32_t ctx;
+};
+/* Open a stream of the task owning `o`: dead tasks' contexts are destroyed first (so a freed slot serves this very
+ * stream), then the task's context is found or made (CREATE_CONTEXT before it is recorded). 0, or the error, and st->ctx
+ * stays 0 then. */
+static inline int sgpu_ctx_stream_open(const struct sgpu_ctx_ops *ops, struct sgpu_ctx_book *b, struct sgpu_ctx_owner *o,
+                                       struct sgpu_ctx_stream *st)
+{
+    uint32_t id = 0;
+    int create = 0;
+    st->ctx = 0;
+    int r = ops->flush(ops->cookie);
+    if (!r) r = sgpu_ctx_want(b, o, &id, &create);
+    if (!r && create) {
+        r = ops->create(ops->cookie, id);
+        if (!r) sgpu_ctx_made(b, o, id);
+    }
+    if (!r) st->ctx = id;
+    return r;
+}
+/* The SUBMIT descriptor of an opened stream: its context is the stream's, never a constant and never read from user memory. */
+static inline void sgpu_ctx_stream_desc(const struct sgpu_ctx_stream *st, struct sgpu_desc *d, uint32_t cb_id,
+                                        uint16_t flags, uint64_t stream_offset, uint32_t stream_bytes, uint64_t bt_offset,
+                                        uint32_t bt_count, uint32_t stamp_index, uint32_t stamp_value, uint32_t budget_ms,
+                                        uint64_t tag)
+{
+    sgpu_guest_desc_submit(d, st->ctx, cb_id, flags, stream_offset, stream_bytes, bt_offset, bt_count, stamp_index,
+                           stamp_value, budget_ms, tag);
 }

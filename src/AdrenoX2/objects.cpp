@@ -40,6 +40,15 @@ static bool isWindowServer(task_t owner)
            entitled(owner, "com.apple.private.gpuwrangler");
 }
 static uint32_t gWindowServerTasks;
+#if ADRENO_SOFTGPU
+extern "C" void *get_bsdtask_info(task_t);       // XNU: the BSD proc of a task (not in the Kernel.framework headers)
+extern "C" int proc_pid(void *);
+static int32_t taskPid(task_t owner)
+{
+    void *proc = get_bsdtask_info(owner);
+    return proc ? (int32_t)proc_pid(proc) : -1;
+}
+#endif
 
 AdrenoTask *AdrenoTask::withTask(IOGPU *gpu, task_t owner, IORangeAllocator *allocator)
 {
@@ -55,6 +64,12 @@ AdrenoTask *AdrenoTask::withTask(IOGPU *gpu, task_t owner, IORangeAllocator *all
         t->fWindowServer = true;
         t->fSequence = __atomic_add_fetch(&gWindowServerTasks, 1, __ATOMIC_RELAXED);
     }
+#if ADRENO_SOFTGPU
+    if (t) {        // whose quota the task's SoftGPU context counts against (softgpu-ctx.h)
+        t->fSoftCtx.pid = owner == kernel_task ? 0 : taskPid(owner);
+        t->fSoftCtx.ws = isWindowServer(owner) ? 1 : 0;
+    }
+#endif
 #if ADRENO_PIPELINE
     if (t) t->fPipelineClient = isWindowServer(owner);   // agents/gpu-pipeline R4: adreno_pipeline=1 pipelines these
 #endif
@@ -77,9 +92,7 @@ void AdrenoTask::free()
     if (fWindowServer && allocations)
         AdrenoEarlyStopClientDied((uint64_t)fSequence << 32 | allocations);
 #if ADRENO_SOFTGPU
-    uint64_t ctxEpoch = 0;
-    const uint32_t ctx = sgpu_ctx_owner_take(&fSoftCtx, &ctxEpoch);
-    if (ctx) AdrenoSoftGPUCtxGone(ctx, ctxEpoch);      // the next stream destroys it, with all of its objects
+    sgpu_ctx_task_gone(&fSoftCtx, AdrenoSoftGPUCtxGone);      // the next stream destroys it, with all of its objects
 #endif
     IOGPUTask::free();
 }
