@@ -45,8 +45,7 @@ extern "C" void *get_bsdtask_info(task_t);       // XNU: the BSD proc of a task 
 extern "C" int proc_pid(void *);
 static int32_t taskPid(task_t owner)
 {
-    void *proc = get_bsdtask_info(owner);
-    return proc ? (int32_t)proc_pid(proc) : -1;
+    return sgpu_ctx_proc_pid(get_bsdtask_info(owner), proc_pid);
 }
 #endif
 
@@ -66,8 +65,7 @@ AdrenoTask *AdrenoTask::withTask(IOGPU *gpu, task_t owner, IORangeAllocator *all
     }
 #if ADRENO_SOFTGPU
     if (t) {        // whose quota the task's SoftGPU context counts against (softgpu-ctx.h)
-        t->fSoftCtx.pid = owner == kernel_task ? 0 : taskPid(owner);
-        t->fSoftCtx.ws = isWindowServer(owner) ? 1 : 0;
+        sgpu_ctx_owner_init(&t->fSoftCtx, owner == kernel_task ? 0 : taskPid(owner), isWindowServer(owner));
     }
 #endif
 #if ADRENO_PIPELINE

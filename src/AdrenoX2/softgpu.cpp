@@ -183,28 +183,26 @@ static int sgFlushPending(AdrenoSoftGPU *s)
             gSoftPendCount--;
             if (gSoftPend[gSoftPendCount].epoch == s->epoch) ids[n++] = gSoftPend[gSoftPendCount].id;
         }
-        nctx = sgpu_ctx_pend_take(&gSoftCtxPend, s->epoch, ctxIds, 16);
+        nctx = sgpu_ctx_flush_take(&gSoftCtxPend, &s->ctxs, ctxIds, 16);
         const bool more = gSoftPendCount != 0 || gSoftCtxPend.n != 0;
         IOSimpleLockUnlock(lock);
         if (nctx) {
             // A dead task's context: its objects go with it, its memory objects stay (the maps retire those).
-            // sgpu_ctx_destroy_batch: only the descriptors that were queued leave the book; a failed push leaves the rest
-            // of the batch on the pending list (the host still holds those contexts).
-            struct Cookie { AdrenoSoftGPU *s; } cookie = {s};
-            int r = 0;
-            const uint32_t sent = sgpu_ctx_destroy_batch(&s->ctxs, ctxIds, nctx,
+            // sgpu_ctx_flush_batch: only the descriptors that were queued leave the book; a failed push puts the rest of the
+            // batch back on the pending list (the host still holds those contexts) and ends the pass.
+            struct Cookie { AdrenoSoftGPU *s; IOSimpleLock *lock; } cookie = {s, lock};
+            const struct sgpu_ctx_flush_ops fops = {
                 [](void *c, uint32_t id) {
                     AdrenoSoftGPU *g = static_cast<Cookie *>(c)->s;
                     return sgKernel(g, sizeof(struct sgpu_destroy_context), 0, SGPU_GUEST_NO_STAMP, 0,
                                     [&](uint8_t *p) { return sgpu_guest_pkt_destroy_context(p, sizeof(struct sgpu_destroy_context), id); });
-                }, &cookie, &r);
-            if (sent < nctx) {
-                stuck = true;                                   // do not spin on a queue that keeps refusing
-                IOSimpleLockLock(lock);
-                const uint32_t kept = sgpu_ctx_requeue(&gSoftCtxPend, ctxIds + sent, nctx - sent, s->epoch);
-                IOSimpleLockUnlock(lock);
-                if (kept) ALOG("SoftGPU: %u contexts are kept until the next reset (pending list full)", kept);
-            }
+                },
+                [](void *c) { IOSimpleLockLock(static_cast<Cookie *>(c)->lock); },
+                [](void *c) { IOSimpleLockUnlock(static_cast<Cookie *>(c)->lock); }, &cookie};
+            int r = 0;
+            uint32_t kept = 0;
+            if (sgpu_ctx_flush_batch(&s->ctxs, &gSoftCtxPend, ctxIds, nctx, &fops, &r, &kept)) stuck = true;
+            if (kept) ALOG("SoftGPU: %u contexts are kept until the next reset (pending list full)", kept);
             if (!r) r = sgDrain(s, SG_BUDGET_MS);
             if (r) ALOG("SoftGPU: DESTROY_CONTEXT of %u contexts failed %d", nctx, r);
             if ((r = sgpu_guest_housekeeping_result(r))) return r;     // lost: the reset forgets every context
@@ -218,7 +216,7 @@ static int sgFlushPending(AdrenoSoftGPU *s)
             if (r) ALOG("SoftGPU: DESTROY_MEMORY of %u objects failed %d", n, r);
             if ((r = sgpu_guest_housekeeping_result(r))) return r;
         }
-        if (!more || stuck) return 0;
+        if (!sgpu_ctx_flush_again(more, stuck)) return 0;
     }
 }
 
@@ -473,12 +471,14 @@ void AdrenoAcceleratorX2::softgpuSelfTest()
         if (d || (r = sgDrain(s, SG_BUDGET_MS))) ALOG("SoftGPU: self-test: DESTROY_MEMORY %u failed %d", id, d ? d : r);
     }
     if (ctxMade && r != SGPU_E_LOST && r != SGPU_E_TIMEOUT) {
-        uint64_t e = 0;
-        const uint32_t gone = sgpu_ctx_owner_take(&owner, &e);
-        const int d = sgKernel(s, sizeof(struct sgpu_destroy_context), 0, SGPU_GUEST_NO_STAMP, 0,
-                               [&](uint8_t *p) { return sgpu_guest_pkt_destroy_context(p, sizeof(struct sgpu_destroy_context), gone); });
-        if (d || (r = sgDrain(s, SG_BUDGET_MS))) ALOG("SoftGPU: self-test: DESTROY_CONTEXT %u failed %d", gone, d ? d : r);
-        else sgpu_ctx_destroyed(&s->ctxs, gone);
+        const uint32_t gone = owner.id;
+        const int sent = sgKernel(s, sizeof(struct sgpu_destroy_context), 0, SGPU_GUEST_NO_STAMP, 0,
+                                  [&](uint8_t *p) { return sgpu_guest_pkt_destroy_context(p, sizeof(struct sgpu_destroy_context), gone); });
+        const int done = sent ? 0 : sgDrain(s, SG_BUDGET_MS);
+        if (sent || done) ALOG("SoftGPU: self-test: DESTROY_CONTEXT %u failed %d", gone, sent ? sent : done);
+        // whatever happened the slot is accounted for: freed, or queued for the next stream's flush, or cleared by the reset
+        const int lost = sgpu_ctx_retire(&s->ctxs, &owner, sent, done, AdrenoSoftGPUCtxGone);
+        if (lost) r = lost;
     }
     // The device is lost or never answered: its contexts are gone or unknowable, start the epoch over (clears the book).
     if (ctxMade && (r == SGPU_E_LOST || r == SGPU_E_TIMEOUT)) softgpuLost(r);

@@ -22,6 +22,12 @@
 #define SGPU_CTX_PER_PID 8u        /* contexts one process (pid) may hold at once */
 #define SGPU_CTX_WS_RESERVE 4u     /* of SGPU_CTX_MAX_LIVE, the slots only a WindowServer task may take */
 #define SGPU_CTX_PEND_MAX 64u      /* dead tasks whose DESTROY_CONTEXT has not been sent yet */
+/* AIR a process may pin in the host's shared library store. The host does not know the process, so the share is made by
+ * construction: SGPU_CTX_PER_PID contexts per process (above) times the host's per-context AIR cap (AIR_CTX_CAP in the
+ * host's sgpu_exec.cpp, which must equal SGPU_CTX_AIR_CAP). */
+#define SGPU_CTX_AIR_PID_CAP (64u << 20)
+#define SGPU_CTX_AIR_CAP (SGPU_CTX_AIR_PID_CAP / SGPU_CTX_PER_PID)
+_Static_assert(SGPU_CTX_AIR_CAP * SGPU_CTX_PER_PID <= SGPU_CTX_AIR_PID_CAP, "per-process AIR share");
 
 struct sgpu_ctx_owner {            /* a task's context: lives inside AdrenoTask */
     uint64_t epoch;                /* the device epoch `id` belongs to */
@@ -40,6 +46,20 @@ struct sgpu_ctx_pend {             /* the dead tasks' contexts; the kext guards 
     uint32_t n;
     struct { uint32_t id; uint64_t epoch; } e[SGPU_CTX_PEND_MAX];
 };
+
+/* The record of a task made for process `pid` (-1: unknown) that is WindowServer's when `ws` is non-zero. Set once. */
+static inline void sgpu_ctx_owner_init(struct sgpu_ctx_owner *o, int32_t pid, int ws)
+{
+    o->epoch = 0;
+    o->id = 0;
+    o->pid = pid;
+    o->ws = ws ? 1 : 0;
+}
+/* The pid of a task's BSD process, -1 when it has none. */
+static inline int32_t sgpu_ctx_proc_pid(void *proc, int (*pid_of)(void *))
+{
+    return proc ? (int32_t)pid_of(proc) : -1;
+}
 
 /* A new device epoch (bring-up or reset): the host holds no context any more. */
 static inline void sgpu_ctx_book_reset(struct sgpu_ctx_book *b, uint64_t epoch)
@@ -153,6 +173,51 @@ static inline uint32_t sgpu_ctx_requeue(struct sgpu_ctx_pend *p, const uint32_t 
     for (uint32_t i = 0; i < n; i++)
         if (sgpu_ctx_pend_push(p, ids[i], epoch)) lost++;
     return lost;
+}
+
+/* One drain pass over `ids[0..n)`, taken by sgpu_ctx_flush_take: destroy_batch, and what it could not send goes back on the
+ * pending list under the caller's lock, in the book's own epoch. Returns 1 when something is left over (the caller stops
+ * its pass instead of spinning on a queue that keeps refusing); *err is the send error, *kept what did not fit back. */
+struct sgpu_ctx_flush_ops {
+    int (*send)(void *cookie, uint32_t id);     /* DESTROY_CONTEXT pushed: 0 */
+    void (*lock)(void *cookie);                 /* the lock of the pending list */
+    void (*unlock)(void *cookie);
+    void *cookie;
+};
+static inline uint32_t sgpu_ctx_flush_take(struct sgpu_ctx_pend *p, const struct sgpu_ctx_book *b, uint32_t *ids, uint32_t cap)
+{
+    return sgpu_ctx_pend_take(p, b->epoch, ids, cap);
+}
+static inline int sgpu_ctx_flush_batch(struct sgpu_ctx_book *b, struct sgpu_ctx_pend *p, const uint32_t *ids, uint32_t n,
+                                       const struct sgpu_ctx_flush_ops *ops, int *err, uint32_t *kept)
+{
+    const uint32_t sent = sgpu_ctx_destroy_batch(b, ids, n, ops->send, ops->cookie, err);
+    *kept = 0;
+    if (sent >= n) return 0;
+    ops->lock(ops->cookie);
+    *kept = sgpu_ctx_requeue(p, ids + sent, n - sent, b->epoch);
+    ops->unlock(ops->cookie);
+    return 1;
+}
+/* Does the drain loop go round again: more is pending, and the last pass was not cut short. */
+static inline int sgpu_ctx_flush_again(int more, int stuck)
+{
+    return more && !stuck;
+}
+/* A context the kext made for itself (the self-test's) is done with. `sent_err` is the DESTROY_CONTEXT push, `done_err`
+ * its completion (0 when it was not pushed). A lost or timed-out device forgets everything: that error is returned and the
+ * caller resets (the book starts over). A destroy that was never queued goes to the pending list through `gone`, so the
+ * next stream sends it; otherwise the context has left the host (or the host refused it) and its slot is free. */
+static inline int sgpu_ctx_retire(struct sgpu_ctx_book *b, struct sgpu_ctx_owner *o, int sent_err, int done_err,
+                                  void (*gone)(uint32_t id, uint64_t epoch))
+{
+    uint64_t epoch = 0;
+    const uint32_t id = sgpu_ctx_owner_take(o, &epoch);
+    const int err = sent_err ? sent_err : done_err;
+    if (err == SGPU_E_LOST || err == SGPU_E_TIMEOUT) return err;
+    if (id && sent_err) gone(id, epoch);
+    else sgpu_ctx_destroyed(b, id);
+    return 0;
 }
 
 struct sgpu_ctx_ops {              /* the device side of a stream, under fSubmitLock */

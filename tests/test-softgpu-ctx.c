@@ -33,7 +33,7 @@ static int host_destroy(uint32_t id)
 static struct sgpu_ctx_book book;
 static struct sgpu_ctx_pend pend;
 static int send_fail_after = -1;        /* DESTROY_CONTEXT pushes before the queue refuses (-1: never) */
-static unsigned flushes, creates;
+static unsigned flushes, creates, locks, unlocks, sends;
 static void device_reset(uint64_t epoch)
 {
     memset(host, 0, sizeof host);
@@ -49,23 +49,34 @@ static void ctx_gone(uint32_t id, uint64_t epoch)
 static int send_destroy(void *cookie, uint32_t id)
 {
     (void)cookie;
+    sends++;
     if (send_fail_after == 0) return SGPU_E_QUOTA;
     if (send_fail_after > 0) send_fail_after--;
     CHECK(host_destroy(id) == 0);      /* queued descriptors reach the host */
     return 0;
 }
-/* sgFlushPending: the dead tasks' contexts */
+/* sgFlushPending: the dead tasks' contexts, through the same helpers the kext calls */
+static int flush_err;                   /* the flush itself fails with this (a lost device) */
+static void pend_lock(void *c) { (void)c; locks++; }
+static void pend_unlock(void *c) { (void)c; unlocks++; }
 static int flush_dev(void *cookie)
 {
-    uint32_t ids[16], n;
+    uint32_t ids[16];
+    int stuck = 0;
     (void)cookie;
     flushes++;
-    for (;;) {
-        n = sgpu_ctx_pend_take(&pend, book.epoch, ids, 16);
-        if (!n) return 0;
-        int err = 0;
-        const uint32_t sent = sgpu_ctx_destroy_batch(&book, ids, n, send_destroy, NULL, &err);
-        if (sent < n) { sgpu_ctx_requeue(&pend, ids + sent, n - sent, book.epoch); return 0; }
+    if (flush_err) return flush_err;
+    for (unsigned pass = 0;; pass++) {
+        if (pass > 50) { CHECK(!"the flush spins on a queue that keeps refusing"); return -1; }
+        const uint32_t n = sgpu_ctx_flush_take(&pend, &book, ids, 16);
+        const int more = pend.n != 0;
+        if (n) {
+            const struct sgpu_ctx_flush_ops fops = {send_destroy, pend_lock, pend_unlock, NULL};
+            int err = 0;
+            uint32_t kept = 0;
+            if (sgpu_ctx_flush_batch(&book, &pend, ids, n, &fops, &err, &kept)) stuck = 1;
+        }
+        if (!sgpu_ctx_flush_again(more, stuck)) return 0;
     }
 }
 static int create_dev(void *cookie, uint32_t id) { (void)cookie; creates++; return host_create(id); }
@@ -86,9 +97,12 @@ static int stream(struct sgpu_ctx_owner *task, uint32_t *ctx)
 }
 static void task_dies(struct sgpu_ctx_owner *task) { sgpu_ctx_task_gone(task, ctx_gone); }
 static void flush(void) { CHECK(flush_dev(NULL) == 0); }
-static struct sgpu_ctx_owner mk(int32_t pid, uint32_t ws) { struct sgpu_ctx_owner o = {0, 0, pid, ws}; return o; }
+static struct sgpu_ctx_owner mk(int32_t pid, uint32_t ws) { struct sgpu_ctx_owner o; sgpu_ctx_owner_init(&o, pid, (int)ws); return o; }
 
-/* ---- the source wiring ---- */
+/* ---- the source wiring ----
+ * What cannot run here is the kext's own glue (it needs XNU). Its logic sits in softgpu-ctx.h and is driven above; what is
+ * left in softgpu.cpp and objects.cpp is checked as whole statements (comments dropped, white space collapsed), so an edit
+ * that keeps a substring but changes an argument, an operand or a condition no longer matches. */
 static char *slurp(const char *dir, const char *rel)
 {
     char path[512];
@@ -98,63 +112,249 @@ static char *slurp(const char *dir, const char *rel)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     rewind(f);
-    char *s = calloc(1, (size_t)n + 1);
+    char *s = calloc(1, (size_t)n + 1), *o = calloc(1, (size_t)n + 1);
     if (fread(s, 1, (size_t)n, f) != (size_t)n) s[0] = 0;
     fclose(f);
-    for (char *p = s; *p; p++) {          /* blank the comments, keep the offsets */
-        if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') *p++ = ' '; if (!*p) break; }
-        else if (p[0] == '/' && p[1] == '*') {
-            while (*p && !(p[0] == '*' && p[1] == '/')) { if (*p != '\n') *p = ' '; p++; }
-            if (*p) { *p++ = ' '; *p = ' '; }
-            if (!*p) break;
-        }
+    size_t w = 0;
+    int space = 0;
+    for (const char *p = s; *p; p++) {         /* drop comments, collapse white space */
+        if (p[0] == '/' && p[1] == '/') { while (p[1] && p[1] != '\n') p++; space = 1; continue; }
+        if (p[0] == '/' && p[1] == '*') { p += 2; while (*p && !(p[0] == '*' && p[1] == '/')) p++; if (*p) p++; space = 1; continue; }
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') { space = 1; continue; }
+        if (space && w) o[w++] = ' ';
+        space = 0;
+        o[w++] = *p;
     }
-    return s;
+    free(s);
+    return o;
 }
-/* the text from the first `from` up to the next `to` (or the end) */
-static char *region(const char *s, const char *from, const char *to)
+/* the braced body that follows the first `from` (balanced), or "" */
+static char *body(const char *s, const char *from)
 {
     const char *a = strstr(s, from);
     if (!a) { printf("FAIL no %s\n", from); failures++; return calloc(1, 1); }
-    const char *b = to ? strstr(a + strlen(from), to) : NULL;
-    size_t n = b ? (size_t)(b - a) : strlen(a);
-    char *r = calloc(1, n + 1);
-    memcpy(r, a, n);
+    const char *b = strchr(a + strlen(from), '{');
+    int depth = 0;
+    const char *e = b;
+    for (; e && *e; e++) {
+        if (*e == '{') depth++;
+        else if (*e == '}' && --depth == 0) break;
+    }
+    if (!b || !e || !*e) { printf("FAIL no body for %s\n", from); failures++; return calloc(1, 1); }
+    char *r = calloc(1, (size_t)(e - b) + 2);
+    memcpy(r, b, (size_t)(e - b) + 1);
     return r;
 }
+static int idc(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+/* occurrences of `needle` that start and end on identifier boundaries (a needle ending in punctuation needs none there) */
 static unsigned count(const char *s, const char *needle)
 {
     unsigned n = 0;
-    for (const char *p = s; (p = strstr(p, needle)); p += strlen(needle)) n++;
+    const size_t l = strlen(needle);
+    for (const char *p = s; (p = strstr(p, needle)); p += l) {
+        if (idc(needle[0]) && p != s && idc(p[-1])) continue;
+        if (idc(needle[l - 1]) && idc(p[l])) continue;
+        n++;
+    }
     return n;
+}
+static void once(const char *where, const char *text, const char *stmt)
+{
+    checks++;
+    if (count(text, stmt) != 1) { failures++; printf("FAIL %s: expected exactly once: %s\n", where, stmt); }
+}
+static void never(const char *where, const char *text, const char *needle)
+{
+    checks++;
+    if (count(text, needle)) { failures++; printf("FAIL %s: must not appear: %s\n", where, needle); }
+}
+static void exactly(const char *where, const char *text, const char *needle, unsigned n)
+{
+    checks++;
+    if (count(text, needle) != n) { failures++; printf("FAIL %s: %s must appear %u times\n", where, needle, n); }
 }
 static void wiring(const char *dir)
 {
     char *sg = slurp(dir, "src/AdrenoX2/softgpu.cpp"), *ob = slurp(dir, "src/AdrenoX2/objects.cpp");
     if (!sg || !ob) return;
     /* submitStream: the descriptor's context comes from the opened stream, never from a literal or a bare id */
-    char *ss = region(sg, "int AdrenoAcceleratorX2::submitStream(", NULL);
-    CHECK(count(ss, "sgpu_ctx_stream_open(") == 1);
-    CHECK(count(ss, "sgpu_ctx_stream_desc(&st, &d,") == 1);
-    CHECK(count(ss, "sgpu_guest_desc_submit(") == 0);
-    CHECK(count(ss, "sgpu_ctx_want(") == 0);
+    char *ss = body(sg, "int AdrenoAcceleratorX2::submitStream(");
+    once("submitStream", ss, "struct sgpu_ctx_stream st = {};");
+    once("submitStream", ss, "struct sgpu_ctx_ops ops = { [](void *c) { return sgFlushPending(static_cast<AdrenoSoftGPU *>(c)); }, "
+                             "[](void *c, uint32_t id) { return sgCreateContext(static_cast<AdrenoSoftGPU *>(c), id); }, s};");
+    once("submitStream", ss, "result = sgpu_ctx_stream_open(&ops, &s->ctxs, task->softgpuContext(), &st);");
+    once("submitStream", ss, "sgpu_ctx_stream_desc(&st, &d, ++s->cbSerial, SGPU_DESC_LAST, off, sbytes, off + sbytes, (uint32_t)count, "
+                             "SGPU_GUEST_NO_STAMP, 0, 0, (uint64_t)(uintptr_t)list);");
+    once("submitStream", ss, "AdrenoDeviceGPUTask(dev)");                    /* the task of the command buffer's device */
+    exactly("submitStream", ss, "&st", 2);                                    /* the open and the descriptor, nothing else */
+    never("submitStream", ss, "st.");                                         /* the stream's context is never assigned */
+    exactly("submitStream", ss, "st =", 1);                                   /* only its declaration */
+    never("submitStream", ss, "ctx_id");
+    never("submitStream", ss, "sgpu_guest_desc_submit");
+    never("submitStream", ss, "sgpu_ctx_want");
+    never("submitStream", ss, "sgpu_ctx_made");
+    exactly("submitStream", ss, "task->softgpuContext()", 1);                 /* the task's own record, no other */
     CHECK(strstr(ss, "sgpu_ctx_stream_open(") < strstr(ss, "sgpu_ctx_stream_desc("));
-    CHECK(count(ss, "task->softgpuContext()") == 1);                     /* the task's own record, no other */
-    CHECK(strstr(ss, "AdrenoDeviceGPUTask(dev)") != NULL);               /* the task of the command buffer's device */
-    CHECK(strstr(ss, "sgFlushPending(static_cast<AdrenoSoftGPU *>(c))") != NULL);   /* the flush the open runs first */
     /* the free hook, with the epoch check on the other side of it */
-    char *fr = region(ob, "void AdrenoTask::free()", "\n}\n");
-    CHECK(count(fr, "sgpu_ctx_task_gone(&fSoftCtx, AdrenoSoftGPUCtxGone)") == 1);
-    char *gone = region(sg, "extern \"C\" void AdrenoSoftGPUCtxGone(", "\n}\n");
-    CHECK(strstr(gone, "epoch != __atomic_load_n(&gSoftEpoch") != NULL && strstr(gone, "sgpu_ctx_pend_push(&gSoftCtxPend") != NULL);
-    /* the quota identity is recorded when the task is made */
-    char *wt = region(ob, "AdrenoTask *AdrenoTask::withTask(", "\nuint64_t AdrenoTask::allocate");
-    CHECK(strstr(wt, "fSoftCtx.pid = ") != NULL && strstr(wt, "fSoftCtx.ws = isWindowServer(owner)") != NULL);
-    /* the batch destroy: only what was queued leaves the book, the rest goes back */
-    char *fp = region(sg, "static int sgFlushPending(", "\n}\n");
-    CHECK(count(fp, "sgpu_ctx_destroy_batch(&s->ctxs, ctxIds, nctx") == 1 && count(fp, "sgpu_ctx_requeue(&gSoftCtxPend, ctxIds + sent") == 1);
-    CHECK(count(fp, "sgpu_ctx_destroyed(") == 0);
-    free(ss); free(fr); free(gone); free(wt); free(fp); free(sg); free(ob);
+    char *fr = body(ob, "void AdrenoTask::free()");
+    once("free", fr, "sgpu_ctx_task_gone(&fSoftCtx, AdrenoSoftGPUCtxGone);");
+    char *gone = body(sg, "extern \"C\" void AdrenoSoftGPUCtxGone(");
+    once("CtxGone", gone, "if (!lock || !id || epoch != __atomic_load_n(&gSoftEpoch, __ATOMIC_RELAXED)) return;");
+    once("CtxGone", gone, "const int r = sgpu_ctx_pend_push(&gSoftCtxPend, id, epoch);");
+    /* the quota identity is recorded once, when the task is made, from the opener's pid and entitlements */
+    char *wt = body(ob, "AdrenoTask *AdrenoTask::withTask(");
+    once("withTask", wt, "sgpu_ctx_owner_init(&t->fSoftCtx, owner == kernel_task ? 0 : taskPid(owner), isWindowServer(owner));");
+    char *tp = body(ob, "static int32_t taskPid(task_t owner)");
+    CHECK(strcmp(tp, "{ return sgpu_ctx_proc_pid(get_bsdtask_info(owner), proc_pid); }") == 0);
+    never("objects.cpp", ob, "fSoftCtx.");                                   /* no other write to the record */
+    exactly("objects.cpp", ob, "fSoftCtx", 2);                                /* its init and the free hook */
+    /* the drain: every context step goes through the tested helpers, in the book's own epoch */
+    char *fp = body(sg, "static int sgFlushPending(");
+    once("sgFlushPending", fp, "nctx = sgpu_ctx_flush_take(&gSoftCtxPend, &s->ctxs, ctxIds, 16);");
+    once("sgFlushPending", fp, "struct Cookie { AdrenoSoftGPU *s; IOSimpleLock *lock; } cookie = {s, lock};");
+    once("sgFlushPending", fp, "[](void *c) { IOSimpleLockLock(static_cast<Cookie *>(c)->lock); }, "
+                               "[](void *c) { IOSimpleLockUnlock(static_cast<Cookie *>(c)->lock); }, &cookie};");
+    once("sgFlushPending", fp, "if (sgpu_ctx_flush_batch(&s->ctxs, &gSoftCtxPend, ctxIds, nctx, &fops, &r, &kept)) stuck = true;");
+    once("sgFlushPending", fp, "if (!sgpu_ctx_flush_again(more, stuck)) return 0;");
+    once("sgFlushPending", fp, "bool stuck = false;");
+    exactly("sgFlushPending", fp, "stuck", 3);                                /* declared, set, passed on: no more, no fewer */
+    exactly("sgFlushPending", fp, "s->epoch", 1);                             /* the memory ids' own filter */
+    never("sgFlushPending", fp, "sgpu_ctx_destroy_batch");
+    never("sgFlushPending", fp, "sgpu_ctx_requeue");
+    never("sgFlushPending", fp, "sgpu_ctx_pend_take");
+    never("sgFlushPending", fp, "sgpu_ctx_destroyed");
+    /* the self-test's own context leaves through sgpu_ctx_retire, whatever the destroy did */
+    once("selftest", sg, "const int lost = sgpu_ctx_retire(&s->ctxs, &owner, sent, done, AdrenoSoftGPUCtxGone);");
+    once("selftest", sg, "if (lost) r = lost;");
+    never("softgpu.cpp", sg, "sgpu_ctx_destroyed");
+    never("softgpu.cpp", sg, "sgpu_ctx_owner_take");
+    free(ss); free(fr); free(gone); free(wt); free(tp); free(fp); free(sg); free(ob);
+}
+static int fake_pid_of(void *p) { return *(int *)p; }
+/* ---- behaviour of the new helpers ---- */
+static void helpers(void)
+{
+    /* sgpu_ctx_owner_init overwrites a dirty record: no id, no epoch, the pid, ws as 0 or 1 */
+    struct sgpu_ctx_owner o = {99, 5, -7, 3};
+    sgpu_ctx_owner_init(&o, 4242, 0);
+    CHECK(o.epoch == 0 && o.id == 0 && o.pid == 4242 && o.ws == 0);
+    sgpu_ctx_owner_init(&o, 0, 17);
+    CHECK(o.pid == 0 && o.ws == 1);
+    sgpu_ctx_owner_init(&o, -1, 1);
+    CHECK(o.pid == -1 && o.ws == 1);
+    { int pid = 321; CHECK(sgpu_ctx_proc_pid(&pid, fake_pid_of) == 321); CHECK(sgpu_ctx_proc_pid(NULL, fake_pid_of) == -1); }
+    /* the recorded identity is what the quota uses: the pid cap and the WindowServer reserve */
+    device_reset(60);
+    { struct sgpu_ctx_owner t2[SGPU_CTX_PER_PID + 1]; uint32_t c;
+      for (unsigned i = 0; i <= SGPU_CTX_PER_PID; i++) sgpu_ctx_owner_init(&t2[i], 4242, 0);
+      for (unsigned i = 0; i < SGPU_CTX_PER_PID; i++) CHECK(stream(&t2[i], &c) == 0);
+      CHECK(stream(&t2[SGPU_CTX_PER_PID], &c) == SGPU_E_QUOTA);                 /* the same pid shares one cap */
+      for (unsigned i = 0; i < SGPU_CTX_PER_PID; i++) task_dies(&t2[i]);
+      flush(); }
+    device_reset(61);
+    { struct sgpu_ctx_owner junk[SGPU_CTX_MAX_LIVE]; uint32_t c; unsigned k = 0;
+      for (int pid = 0; k < SGPU_CTX_MAX_LIVE - SGPU_CTX_WS_RESERVE; pid++)
+          for (unsigned j = 0; j < SGPU_CTX_PER_PID && k < SGPU_CTX_MAX_LIVE - SGPU_CTX_WS_RESERVE; j++, k++) {
+              sgpu_ctx_owner_init(&junk[k], 800 + pid, 0);
+              CHECK(stream(&junk[k], &c) == 0);
+          }
+      struct sgpu_ctx_owner plain, ws;
+      sgpu_ctx_owner_init(&plain, 900, 0);
+      sgpu_ctx_owner_init(&ws, 901, 1);
+      CHECK(stream(&plain, &c) == SGPU_E_QUOTA);                                /* the reserve is not for it ... */
+      CHECK(stream(&ws, &c) == 0);                                              /* ... but for WindowServer */
+      sgpu_ctx_owner_init(&ws, 902, 99);
+      CHECK(ws.ws == 1 && stream(&ws, &c) == 0);                                /* any non-zero flag is WindowServer's */
+      for (unsigned i = 0; i < k; i++) task_dies(&junk[i]);
+      flush(); }
+    /* the flush pass: what was not sent goes back in the BOOK's epoch (so the next take finds it), under the lock, and the
+     * pass reports it; a clean pass touches no lock */
+    device_reset(70);
+    { uint32_t ids[16], c, n; struct sgpu_ctx_owner x[5];
+      for (int i = 0; i < 5; i++) { sgpu_ctx_owner_init(&x[i], 50 + i, 0); CHECK(stream(&x[i], &c) == 0); }
+      for (int i = 0; i < 5; i++) task_dies(&x[i]);
+      CHECK(pend.n == 5);
+      pend.e[0].epoch = 69;                                                     /* an older epoch's id is not taken */
+      locks = unlocks = 0;
+      n = sgpu_ctx_flush_take(&pend, &book, ids, 16);
+      CHECK(n == 4 && pend.n == 0);
+      send_fail_after = 1;
+      { const struct sgpu_ctx_flush_ops fops = {send_destroy, pend_lock, pend_unlock, NULL}; int err = 0; uint32_t kept = 9;
+        CHECK(sgpu_ctx_flush_batch(&book, &pend, ids, n, &fops, &err, &kept) == 1);
+        CHECK(err == SGPU_E_QUOTA && kept == 0 && pend.n == 3 && locks == 1 && unlocks == 1);
+        for (uint32_t i = 0; i < pend.n; i++) CHECK(pend.e[i].epoch == book.epoch);
+        CHECK(sgpu_ctx_flush_take(&pend, &book, ids, 16) == 3);                 /* still takeable: not dropped as stale */
+        locks = unlocks = 0;
+        send_fail_after = -1;
+        CHECK(sgpu_ctx_flush_batch(&book, &pend, ids, 3, &fops, &err, &kept) == 0 && err == 0 && kept == 0);
+        CHECK(locks == 0 && unlocks == 0 && pend.n == 0); }
+      device_reset(71); }
+    /* a full pending list reports what it could not take back */
+    { uint32_t ids[3] = {5, 6, 7}, kept = 0; int err = 0; struct sgpu_ctx_pend p; memset(&p, 0, sizeof p);
+      for (unsigned i = 0; i < SGPU_CTX_PEND_MAX; i++) sgpu_ctx_pend_push(&p, 1000 + i, book.epoch);
+      const struct sgpu_ctx_flush_ops fops = {send_destroy, pend_lock, pend_unlock, NULL};
+      send_fail_after = 0;
+      CHECK(sgpu_ctx_flush_batch(&book, &p, ids, 3, &fops, &err, &kept) == 1 && kept == 3);
+      send_fail_after = -1; }
+    /* the drain loop goes round again only when more is pending and the last pass was not cut short */
+    CHECK(sgpu_ctx_flush_again(1, 0) == 1);
+    CHECK(sgpu_ctx_flush_again(1, 1) == 0);
+    CHECK(sgpu_ctx_flush_again(0, 0) == 0);
+    CHECK(sgpu_ctx_flush_again(0, 1) == 0);
+    /* more dead contexts than one pass takes, and a queue that refuses: the flush ends, nothing is lost or counted free */
+    device_reset(72);
+    { struct sgpu_ctx_owner x[20]; uint32_t c; unsigned k = 0;
+      for (int pid = 0; k < 20; pid++)
+          for (unsigned j = 0; j < 4 && k < 20; j++, k++) { sgpu_ctx_owner_init(&x[k], 3000 + pid, 0); CHECK(stream(&x[k], &c) == 0); }
+      for (unsigned i = 0; i < 20; i++) task_dies(&x[i]);
+      send_fail_after = 0;
+      sends = 0;
+      flush();
+      send_fail_after = -1;
+      CHECK(sends == 1 && host_live() == 20 && book.live == 20 && pend.n == 20);
+      flush();                                                                  /* the queue is back: everything goes */
+      CHECK(host_live() == 0 && book.live == 0 && pend.n == 0); }
+    /* a flush that fails (a lost device) ends the stream: no context is made, nothing is recorded */
+    device_reset(73);
+    { struct sgpu_ctx_owner x = mk(5, 0); uint32_t c = 77; const unsigned c0 = creates;
+      flush_err = SGPU_E_LOST;
+      CHECK(stream(&x, &c) == SGPU_E_LOST && c == 0 && x.id == 0 && creates == c0 && host_live() == 0 && book.live == 0);
+      flush_err = SGPU_E_TIMEOUT;
+      CHECK(stream(&x, &c) == SGPU_E_TIMEOUT && x.id == 0 && creates == c0);
+      flush_err = 0;
+      CHECK(stream(&x, &c) == 0 && x.id == c && creates == c0 + 1);
+      task_dies(&x); flush(); }
+    /* N3: the context the kext made for itself (the self-test) never stays counted, whichever way its destroy ends */
+    device_reset(80);
+    for (int variant = 0; variant < 5; variant++) {
+        struct sgpu_ctx_owner st = mk(0, 1);
+        uint32_t id = 0;
+        int create = 0;
+        CHECK(sgpu_ctx_want(&book, &st, &id, &create) == 0 && create && host_create(id) == 0);
+        sgpu_ctx_made(&book, &st, id);
+        CHECK(book.live == 1 && st.id == id);
+        const int sent_err = variant == 1 ? SGPU_E_QUOTA : variant == 4 ? SGPU_E_TIMEOUT : 0;
+        const int done_err = variant == 2 ? SGPU_E_OBJECT : variant == 3 ? SGPU_E_LOST : 0;
+        if (!sent_err) host_destroy(id);                                          /* the push went out */
+        const int lost = sgpu_ctx_retire(&book, &st, sent_err, done_err, ctx_gone);
+        CHECK(st.id == 0 && st.epoch == 0);
+        if (variant == 3 || variant == 4) {                                       /* lost or timed out: the caller resets */
+            CHECK(lost == (variant == 3 ? SGPU_E_LOST : SGPU_E_TIMEOUT) && pend.n == 0);
+            device_reset(81 + (uint64_t)variant);
+        } else if (variant == 1) {                                                /* never pushed: queued, the next flush sends it */
+            CHECK(lost == 0 && pend.n == 1 && book.live == 1 && host_has(id));
+            flush();
+        } else {                                                                  /* destroyed, or refused by the host */
+            CHECK(lost == 0 && pend.n == 0);
+        }
+        CHECK(book.live == 0 && pend.n == 0);
+        host_destroy(id);
+    }
+    { struct sgpu_ctx_owner none = mk(0, 1); CHECK(sgpu_ctx_retire(&book, &none, 0, 0, ctx_gone) == 0 && book.live == 0); }
+    /* the AIR a process can pin in the host's store: its contexts times the per-context cap the host enforces */
+    CHECK(SGPU_CTX_AIR_PID_CAP == (64u << 20) && SGPU_CTX_AIR_CAP == (8u << 20));
+    CHECK((uint64_t)SGPU_CTX_PER_PID * SGPU_CTX_AIR_CAP <= SGPU_CTX_AIR_PID_CAP);
+    CHECK((uint64_t)SGPU_CTX_AIR_PID_CAP < (256u << 20));                         /* a process never takes the whole store */
 }
 
 int main(int argc, char **argv)
@@ -305,6 +505,7 @@ int main(int argc, char **argv)
     { struct sgpu_ctx_owner x = mk(1, 0); uint32_t id; int create; CHECK(sgpu_ctx_want(&book, &x, &id, &create) == SGPU_E_QUOTA); }
     book.next = 0;
     { struct sgpu_ctx_owner x = mk(1, 0); uint32_t id; int create; CHECK(sgpu_ctx_want(&book, &x, &id, &create) == SGPU_E_QUOTA); }
+    helpers();
     printf("softgpu-ctx: %u checks, %u failures\n", checks, failures);
     return failures != 0;
 }
